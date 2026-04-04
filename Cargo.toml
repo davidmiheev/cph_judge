@@ -1,0 +1,13 @@
+[package]
+name = "cph_judge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ignore = "0.4"
+toml = "0.8"
+colored = "2.1" # Add this for colors
+tokio = { version = "1.51.0", features = ["full"] }
+wait4 = "0.1.3"
