@@ -19,7 +19,7 @@ flowchart TD
     G --> H["Worker: wait4 child process + Tokio timeout"]
     H --> I["Collect Verdicts (AC, WA, TLE, MLE, RE)"]
     I --> J["Tokenized / Float-Aware Output Comparison"]
-    J --> K["Colored Test Results & Final Score"]
+    J --> K["Colored Test Results, RE Traces & Final Score"]
 ```
 
 ---
@@ -48,6 +48,7 @@ flowchart TD
 
 ### 4. Concurrent Execution Engine (`run_with_timeout`)
 - Evaluates test cases in parallel using `tokio::spawn` and `tokio::task::spawn_blocking`.
+- Spawns independent reader threads for `stdout` and `stderr` to prevent pipe deadlocks.
 - Uses `wait4::Wait4` to retrieve process status and resource usage metrics (`rusage.maxrss`).
 - Enforces time limits using `tokio::time::timeout`.
 - Terminates processes that exceed limits using process-tree signal dispatching (`pkill -9 -P` and `kill -9`).
@@ -60,7 +61,7 @@ flowchart TD
 | **WA** (Wrong Answer) | Program exited successfully, output differs from expected | `❌ Test #N` (Shows expected vs received) |
 | **TLE** (Time Limit Exceeded) | Execution exceeded `timeLimit` | `⏱️ Test #N TLE (limit)` |
 | **MLE** (Memory Limit Exceeded) | Peak RSS exceeded `memoryLimit` | `💾 Test #N MLE (limit)` |
-| **RE** (Runtime Error) | Non-zero exit code, signal termination, or panic | `💥 Test #N RE` |
+| **RE** (Runtime Error) | Non-zero exit code, signal termination, or panic | `💥 Test #N RE (status)` with crash / panic trace |
 
 ---
 

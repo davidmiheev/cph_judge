@@ -64,47 +64,87 @@ pub fn compare_outputs(actual: &str, expected: &str) -> bool {
     true
 }
 
+use std::os::unix::process::ExitStatusExt;
+
+#[derive(Debug)]
+pub enum RunError {
+    Tle,
+    Mle,
+    Re {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+    System(String),
+}
+
+fn format_exit_status(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        format!("exit code {}", code)
+    } else if let Some(sig) = status.signal() {
+        match sig {
+            6 => "SIGABRT (abort / panic)".to_string(),
+            8 => "SIGFPE (div by zero / arithmetic error)".to_string(),
+            11 => "SIGSEGV (segmentation fault / memory error)".to_string(),
+            sig => format!("signal {}", sig),
+        }
+    } else {
+        "terminated unexpectedly".to_string()
+    }
+}
+
 async fn run_with_timeout(
     bin_path: &Path,
     project_root: &Path,
     input: &str,
     timeout_duration: Duration,
     memory_limit_bytes: u64,
-) -> Result<(std::process::Output, u64), &'static str> {
+) -> Result<(std::process::Output, u64), RunError> {
     let mut child = Command::new(bin_path)
         .current_dir(project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .expect("Failed to spawn process");
+        .map_err(|e| RunError::System(e.to_string()))?;
 
     let pid = child.id();
     let input_owned = input.as_bytes().to_vec();
 
-    let run_task = tokio::task::spawn_blocking(move || -> Result<(Output, u64), &'static str> {
+    let run_task = tokio::task::spawn_blocking(move || -> Result<(Output, u64), RunError> {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(&input_owned);
         }
 
-        let mut stdout_pipe = child.stdout.take().ok_or("RE")?;
+        let mut stdout_pipe = child.stdout.take().ok_or_else(|| RunError::System("Failed to capture stdout".into()))?;
         let read_stdout = std::thread::spawn(move || {
             let mut stdout = Vec::new();
             let _ = stdout_pipe.read_to_end(&mut stdout);
             stdout
         });
 
-        let res_use = child.wait4().map_err(|_| "RE")?;
+        let mut stderr_pipe = child.stderr.take().ok_or_else(|| RunError::System("Failed to capture stderr".into()))?;
+        let read_stderr = std::thread::spawn(move || {
+            let mut stderr = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut stderr);
+            stderr
+        });
+
+        let res_use = child.wait4().map_err(|e| RunError::System(e.to_string()))?;
         let stdout = read_stdout.join().unwrap_or_default();
+        let stderr_bytes = read_stderr.join().unwrap_or_default();
+        let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
 
         if !res_use.status.success() {
-            return Err("RE");
+            return Err(RunError::Re {
+                status: res_use.status,
+                stderr,
+            });
         }
 
         let output = Output {
             status: res_use.status,
             stdout,
-            stderr: Vec::new(),
+            stderr: stderr_bytes,
         };
 
         Ok((output, res_use.rusage.maxrss))
@@ -113,15 +153,15 @@ async fn run_with_timeout(
     match timeout(timeout_duration, run_task).await {
         Ok(Ok(Ok((output, max_mem)))) => {
             if max_mem > memory_limit_bytes {
-                return Err("MLE");
+                return Err(RunError::Mle);
             }
             Ok((output, max_mem))
         }
         Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(_)) => Err("RE"),
+        Ok(Err(join_err)) => Err(RunError::System(join_err.to_string())),
         Err(_) => {
             kill_process_tree(pid);
-            Err("TLE")
+            Err(RunError::Tle)
         }
     }
 }
@@ -213,18 +253,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let test_label = format!("Test #{}", i + 1);
         
         match output_result {
-            Err("TLE") => {
+            Err(RunError::Tle) => {
                 let limit_label = format!("{:.2}s", time_limit.as_secs_f32());
                 println!("{}  {} ({})", "⏱️".yellow(), format!("{} TLE", test_label).yellow(), limit_label);
             }
-            Err("MLE") => {
+            Err(RunError::Mle) => {
                 let limit_label = format!("{} MB", memory_limit_bytes / 1024 / 1024);
                 println!("{}  {} ({})", "💾".yellow(), format!("{} MLE", test_label).yellow(), limit_label);
             }
-            Err("RE") => {
-                println!("{}  {}", "💥".red(), format!("{} RE", test_label).red());
+            Err(RunError::Re { status, stderr }) => {
+                let status_desc = format_exit_status(status);
+                println!("{}  {} ({})", "💥".red(), format!("{} RE", test_label).red().bold(), status_desc.yellow());
+                let stderr_trimmed = stderr.trim();
+                if !stderr_trimmed.is_empty() {
+                    println!("{}", "--- Stderr / Crash Trace ---".magenta());
+                    println!("{}", stderr_trimmed);
+                    println!("{}", "----------------------------".magenta());
+                }
             }
-            Err(e) => {
+            Err(RunError::System(e)) => {
                 println!("{}  {} ({})", "⚠️".red(), format!("{} Error", test_label).red(), e);
             }
             Ok((output, max_mem)) => {
