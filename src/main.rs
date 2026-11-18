@@ -126,7 +126,7 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
         handles.push(tokio::spawn(async move {
             let _permit = permits.acquire_owned().await.expect("semaphore is never closed");
-            let result = match run_once(&bin_path, [] as [&str; 0], &project_root, test.input.as_bytes(), limits.wall_cap()).await {
+            let result = match run_once(&bin_path, [] as [&str; 0], &project_root, test.input.as_bytes(), &limits).await {
                 Ok(report) => report.check(&limits),
                 Err(e) => Err(e),
             };

@@ -57,11 +57,14 @@ flowchart TD
   program that streams output while still reading input cannot deadlock the judge.
 - `wait4::Wait4` returns the exit status and resource usage: user + system **CPU time** and
   `rusage.maxrss`.
-- The time limit is enforced on **CPU time**. A hard **wall-clock cap** of `2 × timeLimit + 500 ms`
-  (`tokio::time::timeout`) kills processes that are blocked or sleeping and so never accumulate CPU
-  time. Trade-off: an infinite loop is reported after the wall cap, not at the time limit.
-- Processes past the wall cap are terminated with process-tree signal dispatching (`pkill -9 -P`
-  and `kill -9`).
+- The time limit is enforced on **CPU time**. While a process runs, a watcher polls every 10 ms and
+  kills it once its CPU time exceeds the limit (Linux: user + system time from `/proc/<pid>/stat`,
+  10 ms resolution), so an infinite loop is reported at the limit.
+- A hard **wall-clock cap** of `2 × timeLimit + 500 ms` kills processes that are blocked or sleeping
+  and so never accumulate CPU time. On platforms without `/proc` it is the only live enforcement,
+  and an infinite loop is then reported after the cap instead of at the limit.
+- Processes are terminated with process-tree signal dispatching (`pkill -9 -P` and `kill -9`).
+  The watcher stops touching a pid as soon as the child has been reaped, because the pid may be reused.
 
 ### 5. Verdict Evaluation
 
@@ -71,7 +74,7 @@ Checked in this order: TLE, RE, MLE, then output comparison.
 |---|---|---|
 | **AC** (Accepted) | Program exited successfully, output matches expected within tolerance | `✅ Test #N (CPU time, memory)` |
 | **WA** (Wrong Answer) | Program exited successfully, output differs from expected | `❌ Test #N` (Shows expected vs received) |
-| **TLE** (Time Limit Exceeded) | CPU time exceeded `timeLimit`, or the wall-clock cap was hit | `⏱️ Test #N TLE (limit)` |
+| **TLE** (Time Limit Exceeded) | CPU time exceeded `timeLimit` (killed live on Linux), or the wall-clock cap was hit | `⏱️ Test #N TLE (limit)` |
 | **MLE** (Memory Limit Exceeded) | Peak RSS exceeded `memoryLimit` | `💾 Test #N MLE (limit)` |
 | **RE** (Runtime Error) | Non-zero exit code, signal termination, or panic | `💥 Test #N RE (status)` with crash / panic trace |
 

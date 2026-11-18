@@ -4,8 +4,9 @@
 //! interactor) can reuse the raw run and apply their own interpretation:
 //!
 //! 1. [`run_once`] spawns the process, feeds stdin, drains stdout/stderr, and
-//!    reports exit status plus resource usage as a [`RunReport`]. It only fails
-//!    when the process cannot be run or exceeds the hard wall-clock cap.
+//!    reports exit status plus resource usage as a [`RunReport`]. While it runs, the
+//!    process is killed as soon as its CPU time passes the limit (Linux: polled from
+//!    `/proc`) or the hard wall-clock cap is hit; both are reported as TLE.
 //! 2. [`RunReport::check`] turns a report into a verdict using [`Limits`].
 
 use std::{
@@ -13,10 +14,16 @@ use std::{
     io::{Read, Write},
     path::Path,
     process::{Command, ExitStatus, Stdio},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
-use tokio::time::timeout;
 use wait4::Wait4;
+
+/// How often a running process is checked against its CPU and wall-clock limits.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub enum RunError {
@@ -37,8 +44,9 @@ impl Limits {
     /// Hard wall-clock cap after which the process is killed and reported as TLE.
     ///
     /// The time limit itself is enforced on CPU time, so a process that is merely
-    /// descheduled is not penalised. This cap only catches processes that are
-    /// blocked or sleeping (and so never accumulate CPU time).
+    /// descheduled is not penalised. This cap catches processes that are blocked or
+    /// sleeping (and so never accumulate CPU time), and is the only enforcement on
+    /// platforms where CPU time cannot be polled while a process runs.
     pub fn wall_cap(&self) -> Duration {
         self.time * 2 + Duration::from_millis(500)
     }
@@ -87,15 +95,16 @@ impl RunReport {
 
 /// Runs `program` with `args` in `cwd`, feeding it `input` on stdin.
 ///
-/// Returns `Err(RunError::Tle)` if the process is still running after `wall_cap`
-/// (it is killed), and `Err(RunError::System)` if it cannot be spawned or waited on.
-/// A non-zero exit status is *not* an error here; see [`RunReport::check`].
+/// Returns `Err(RunError::Tle)` if the process is killed for using more than
+/// `limits.time` of CPU time or running past `limits.wall_cap()`, and
+/// `Err(RunError::System)` if it cannot be spawned or waited on. A non-zero exit
+/// status is *not* an error here; see [`RunReport::check`].
 pub async fn run_once<I, S>(
     program: &Path,
     args: I,
     cwd: &Path,
     input: &[u8],
-    wall_cap: Duration,
+    limits: &Limits,
 ) -> Result<RunReport, RunError>
 where
     I: IntoIterator<Item = S>,
@@ -112,8 +121,14 @@ where
 
     let pid = child.id();
     let input_owned = input.to_vec();
+    let deadline = Instant::now() + limits.wall_cap();
 
-    let run_task = tokio::task::spawn_blocking(move || -> Result<RunReport, RunError> {
+    // Set as soon as the child has been reaped: from then on its pid may be reused,
+    // so the watcher below must neither read /proc/<pid> nor signal it.
+    let reaped = Arc::new(AtomicBool::new(false));
+    let reaped_by_runner = Arc::clone(&reaped);
+
+    let mut run_task = tokio::task::spawn_blocking(move || -> Result<RunReport, RunError> {
         let stdin = child.stdin.take();
         let mut stdout_pipe = child
             .stdout
@@ -145,7 +160,9 @@ where
             buf
         });
 
-        let res_use = child.wait4().map_err(|e| RunError::System(e.to_string()))?;
+        let waited = child.wait4();
+        reaped_by_runner.store(true, Ordering::Release);
+        let res_use = waited.map_err(|e| RunError::System(e.to_string()))?;
         let stdout = read_stdout.join().unwrap_or_default();
         let stderr = read_stderr.join().unwrap_or_default();
 
@@ -158,14 +175,58 @@ where
         })
     });
 
-    match timeout(wall_cap, run_task).await {
-        Ok(Ok(report)) => report,
-        Ok(Err(join_err)) => Err(RunError::System(join_err.to_string())),
-        Err(_) => {
-            kill_process_tree(pid);
-            Err(RunError::Tle)
+    loop {
+        tokio::select! {
+            joined = &mut run_task => {
+                return match joined {
+                    Ok(report) => report,
+                    Err(join_err) => Err(RunError::System(join_err.to_string())),
+                };
+            }
+            _ = tokio::time::sleep(POLL_INTERVAL) => {
+                if reaped.load(Ordering::Acquire) {
+                    continue; // already finished; the task result is about to arrive
+                }
+                let over_wall_cap = Instant::now() >= deadline;
+                let over_cpu_limit = process_cpu_time(pid).is_some_and(|t| t > limits.time);
+                if over_wall_cap || over_cpu_limit {
+                    kill_process_tree(pid);
+                    return Err(RunError::Tle);
+                }
+            }
         }
     }
+}
+
+/// Linux `/proc/<pid>/stat` reports CPU time in clock ticks of `USER_HZ`, which is a
+/// fixed 100 Hz in the Linux user-space ABI (the value `getconf CLK_TCK` prints).
+#[cfg(target_os = "linux")]
+const CLOCK_TICKS_PER_SEC: u64 = 100;
+
+/// CPU time (user + system) a running process has used so far, or `None` where it
+/// cannot be read (non-Linux platforms, or the process is gone).
+#[cfg(target_os = "linux")]
+fn process_cpu_time(pid: u32) -> Option<Duration> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat_cpu_time(&stat)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_cpu_time(_pid: u32) -> Option<Duration> {
+    None
+}
+
+/// Extracts utime + stime (fields 14 and 15) from the contents of `/proc/<pid>/stat`.
+///
+/// The second field is the command name in parentheses and may itself contain spaces
+/// and parentheses, so parsing starts after the *last* `)`.
+#[cfg(target_os = "linux")]
+fn parse_stat_cpu_time(stat: &str) -> Option<Duration> {
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    let mut fields = after_comm.split_whitespace(); // first field here is field 3 (state)
+    let utime: u64 = fields.nth(11)?.parse().ok()?; // field 14
+    let stime: u64 = fields.next()?.parse().ok()?; // field 15
+    Some(Duration::from_millis((utime + stime) * 1000 / CLOCK_TICKS_PER_SEC))
 }
 
 fn kill_process_tree(pid: u32) {
@@ -184,7 +245,6 @@ fn kill_process_tree(pid: u32) {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
-    use std::time::Instant;
 
     const NO_ARGS: [&str; 0] = [];
 
@@ -200,6 +260,15 @@ mod tests {
 
     fn limits() -> Limits {
         Limits { time: Duration::from_millis(1000), memory_bytes: 1000 }
+    }
+
+    /// Limits that no well-behaved test process comes near.
+    fn lenient() -> Limits {
+        Limits { time: Duration::from_secs(30), memory_bytes: 1 << 40 }
+    }
+
+    fn with_time_ms(ms: u64) -> Limits {
+        Limits { time: Duration::from_millis(ms), memory_bytes: 1 << 40 }
     }
 
     // ---- RunReport::check -------------------------------------------------
@@ -254,6 +323,38 @@ mod tests {
         assert!(l.wall_cap() > l.time);
     }
 
+    // ---- /proc/<pid>/stat parsing -------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_cpu_time_from_proc_stat() {
+        // utime = 150 ticks, stime = 50 ticks at 100 Hz -> 2 s.
+        let stat = "4242 (prog) S 1 4242 4242 0 -1 4194304 100 0 0 0 150 50 0 0 20 0 1 0 12345 1000 100";
+        assert_eq!(parse_stat_cpu_time(stat), Some(Duration::from_secs(2)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_command_name_may_contain_spaces_and_parens() {
+        let stat = "4242 (a b) c) S 1 4242 4242 0 -1 4194304 100 0 0 0 150 50 0 0 20 0 1 0 12345 1000 100";
+        assert_eq!(parse_stat_cpu_time(stat), Some(Duration::from_secs(2)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_proc_stat_is_none() {
+        assert_eq!(parse_stat_cpu_time("garbage"), None);
+        assert_eq!(parse_stat_cpu_time("1 (x) S 1 2 3"), None);
+        assert_eq!(parse_stat_cpu_time("1 (x) S 1 4242 4242 0 -1 4194304 100 0 0 0 abc 50"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_cpu_time_of_live_process_and_none_for_missing_pid() {
+        assert!(process_cpu_time(std::process::id()).is_some());
+        assert!(process_cpu_time(u32::MAX).is_none());
+    }
+
     // ---- run_once (spawns real processes) ----------------------------------
 
     #[tokio::test]
@@ -263,7 +364,7 @@ mod tests {
             ["-c", "echo hello; echo oops >&2; exit 3"],
             Path::new("."),
             b"",
-            Duration::from_secs(10),
+            &lenient(),
         )
         .await
         .expect("run");
@@ -274,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn passes_stdin_through() {
-        let r = run_once(Path::new("cat"), NO_ARGS, Path::new("."), b"abc 123\n", Duration::from_secs(10))
+        let r = run_once(Path::new("cat"), NO_ARGS, Path::new("."), b"abc 123\n", &lenient())
             .await
             .expect("run");
         assert_eq!(r.stdout, b"abc 123\n");
@@ -287,7 +388,7 @@ mod tests {
     async fn large_streaming_io_does_not_deadlock() {
         let input: Vec<u8> = (0..300_000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
         assert!(input.len() > 1_000_000);
-        let r = run_once(Path::new("cat"), NO_ARGS, Path::new("."), &input, Duration::from_secs(20))
+        let r = run_once(Path::new("cat"), NO_ARGS, Path::new("."), &input, &with_time_ms(10_000))
             .await
             .expect("cat must not deadlock or time out");
         assert_eq!(r.stdout, input);
@@ -297,7 +398,7 @@ mod tests {
     async fn program_that_ignores_stdin_is_fine() {
         // Child exits without reading a large input: the writer thread gets EPIPE.
         let input = vec![b'x'; 4 * 1024 * 1024];
-        let r = run_once(Path::new("sh"), ["-c", "echo done"], Path::new("."), &input, Duration::from_secs(10))
+        let r = run_once(Path::new("sh"), ["-c", "echo done"], Path::new("."), &input, &lenient())
             .await
             .expect("run");
         assert_eq!(r.stdout, b"done\n");
@@ -306,16 +407,28 @@ mod tests {
 
     #[tokio::test]
     async fn wall_cap_kills_sleeping_process() {
+        // A sleeping process uses no CPU, so only the wall-clock cap can stop it.
+        let l = with_time_ms(100);
         let started = Instant::now();
-        let r = run_once(Path::new("sleep"), ["30"], Path::new("."), b"", Duration::from_millis(300)).await;
+        let r = run_once(Path::new("sleep"), ["30"], Path::new("."), b"", &l).await;
         assert!(matches!(r, Err(RunError::Tle)));
+        assert!(started.elapsed() >= l.wall_cap(), "killed before the wall cap: {:?}", started.elapsed());
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
+    /// The point of polling: an infinite loop is reported at the CPU limit, not
+    /// only after the (much longer) wall-clock cap.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn wall_cap_kills_busy_loop() {
-        let r = run_once(Path::new("sh"), ["-c", "while :; do :; done"], Path::new("."), b"", Duration::from_millis(300)).await;
+    async fn cpu_limit_kills_busy_loop_before_wall_cap() {
+        let l = with_time_ms(300);
+        let started = Instant::now();
+        let r = run_once(Path::new("sh"), ["-c", "while :; do :; done"], Path::new("."), b"", &l).await;
+        let elapsed = started.elapsed();
         assert!(matches!(r, Err(RunError::Tle)));
+        // A single-threaded loop cannot use 300 ms of CPU in less wall time than that.
+        assert!(elapsed >= Duration::from_millis(250), "killed too early: {elapsed:?}");
+        assert!(elapsed < l.wall_cap(), "was not killed by the CPU limit: {elapsed:?}");
     }
 
     #[tokio::test]
@@ -325,7 +438,7 @@ mod tests {
             ["-c", "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done"],
             Path::new("."),
             b"",
-            Duration::from_secs(30),
+            &lenient(),
         )
         .await
         .expect("run");
@@ -334,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_binary_is_system_error() {
-        let r = run_once(Path::new("/nonexistent/binary"), NO_ARGS, Path::new("."), b"", Duration::from_secs(5)).await;
+        let r = run_once(Path::new("/nonexistent/binary"), NO_ARGS, Path::new("."), b"", &lenient()).await;
         assert!(matches!(r, Err(RunError::System(_))));
     }
 }

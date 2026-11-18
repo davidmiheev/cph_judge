@@ -9,7 +9,7 @@ A fast, concurrent competitive programming judge written in Rust, designed to wo
 - **Automatic Problem Discovery**: Recursively finds `.prob` configuration files matching problem names using `ignore::WalkBuilder`.
 - **Parallel Test Execution**: Runs test cases concurrently with `tokio` async workers (at most one per CPU core).
 - **Resource Limit Enforcement**:
-  - **Time Limits (TLE)**: Judged on CPU time, with a wall-clock cap and process-tree cleanup for hung processes.
+  - **Time Limits (TLE)**: Judged on CPU time and enforced live (Linux), with a wall-clock cap and process-tree cleanup for hung processes.
   - **Memory Limits (MLE)**: Peak resident set size tracking using `wait4` / `rusage`.
   - **Runtime Errors (RE)**: Robust exit code and signal failure detection.
 - **Tokenized & Float-Aware Comparison**: Token-by-token comparison with automatic floating-point epsilon tolerance ($\epsilon = 10^{-6}$) and whitespace insensitivity.

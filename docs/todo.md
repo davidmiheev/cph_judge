@@ -10,6 +10,7 @@ Current state and planned improvements for `cph_judge`.
 - [x] **Stdin deadlock fix**: input is written from its own thread, so programs that stream output no longer get a false TLE on large inputs.
 - [x] **CPU-time limits**: TLE is judged on user + system CPU time, with a wall-clock cap for blocked processes; at most one test per core runs at a time.
 - [x] **Clean Exit Codes**: `0` all passed, `1` compile failure or failed tests, `2` usage / judge error.
+- [x] **Early Kill on CPU Limit**: a running process is polled and killed as soon as its CPU time passes `timeLimit` (Linux), so infinite loops are reported at the limit rather than after the wall-clock cap.
 
 ---
 
@@ -28,7 +29,7 @@ Checker, interactive and stress work is planned in [`design-stress-interactive.m
 
 ## Features & Improvements
 
-- [ ] **Early Kill on CPU Limit**: An infinite loop is currently reported only after the wall-clock cap (`2 × timeLimit + 500 ms`). Poll CPU time (e.g. `/proc/<pid>/stat`) to kill at the limit instead.
+- [ ] **CPU-Time Polling Outside Linux**: Early kill relies on `/proc`; on macOS an infinite loop is still only caught by the wall-clock cap (`2 × timeLimit + 500 ms`).
 - [ ] **Multi-Language Support**: Extend beyond Rust to support compiling and executing C++, Python, Java, and Go solutions.
 - [ ] **Diff Highlighting for WA**: Improve Wrong Answer visualization with colored diffs for multiline expected vs received mismatches.
 - [ ] **Strict Memory Enforcement**: Enforce memory limits in real-time (e.g. via `setrlimit` or Linux cgroups) rather than post-execution `rusage`.

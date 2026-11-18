@@ -62,7 +62,7 @@ The judge expects JSON config files with `.prob` extension (from Competitive Com
 
 - **AC (Accepted)**: Output matches expected (tokenized comparison with $\epsilon = 10^{-6}$ for floating-point values).
 - **WA (Wrong Answer)**: Output mismatches expected tokens.
-- **TLE (Time Limit Exceeded)**: User + system CPU time (from `wait4` `rusage`) above `timeLimit`. Processes still running after the wall-clock cap (`2 × timeLimit + 500 ms`, via `tokio::time::timeout`) are killed by process tree termination (`pkill -9 -P`, `kill -9`).
+- **TLE (Time Limit Exceeded)**: User + system CPU time above `timeLimit`. A running process is polled every 10 ms (Linux `/proc/<pid>/stat`) and killed by process tree termination (`pkill -9 -P`, `kill -9`) once over the limit; the final check uses `wait4` `rusage`. A wall-clock cap (`2 × timeLimit + 500 ms`) also kills blocked or sleeping processes, and is the only live enforcement on platforms without `/proc`.
 - **MLE (Memory Limit Exceeded)**: Checked via `wait4::Wait4` `rusage.maxrss` against configured `memoryLimit`.
 - **RE (Runtime Error)**: Checked when process exits with non-zero status or termination signal.
 - Checks run in the order TLE, RE, MLE, then output comparison.
