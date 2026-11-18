@@ -79,6 +79,53 @@ fn samples_that_cannot_be_understood_are_explained_and_the_generator_file_is_sug
     assert!(r.stderr.contains("A_gen.rs"), "{}", r.stderr);
 }
 
+// ---- reducing the counterexample ----------------------------------------------------------
+
+#[test]
+fn the_counterexample_is_reduced_to_the_simplest_input_that_still_fails() {
+    let p = project("reduced");
+    let r = p.run_with(&["--stress", "--seed", "1"]);
+    assert_eq!(r.code, Some(1), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    // The solution is wrong from three numbers on, and any numbers show it: the least is three ones.
+    assert_eq!(counterexample_input(&p), "3\n1 1 1\n", "{}", r.stdout);
+    assert!(r.stdout.contains("then reduced in"), "{}", r.stdout);
+    assert!(r.stdout.contains("--- Input ---\n3\n1 1 1\n"), "{}", r.stdout);
+}
+
+#[test]
+fn reduction_stays_inside_the_constraints() {
+    let p = project("reduced_constrained");
+    p.problem_with_hints(&SAMPLES, r#"{"vars":{"a":"5..9"}}"#);
+    p.run_with(&["--stress", "--seed", "1"]);
+    // Not 1 1 1: the numbers must be 5 to 9.
+    assert_eq!(counterexample_input(&p), "3\n5 5 5\n");
+}
+
+#[test]
+fn the_reduced_input_is_the_one_that_is_saved() {
+    let p = project("reduced_saved");
+    let r = p.run_with(&["--stress", "--seed", "1", "--save"]);
+    assert!(r.stdout.contains("Saved as test #3"), "{}", r.stdout);
+    assert!(p.prob_json().contains(r#""input":"3\n1 1 1\n""#), "{}", p.prob_json());
+}
+
+#[test]
+fn reduction_is_repeatable() {
+    let p = project("reduced_repeatable");
+    let first = p.run_with(&["--stress", "--seed", "7"]);
+    let second = p.run_with(&["--stress", "--seed", "7"]);
+    assert_eq!(first.stdout, second.stdout);
+}
+
+#[test]
+fn a_generator_files_input_is_left_exactly_as_it_made_it() {
+    let p = project("not_reduced");
+    p.generator("fn main() { println!(\"3\\n10 20 30\"); }\n");
+    let r = p.run_with(&["--stress", "--seed", "1", "--iters", "5"]);
+    assert!(!r.stdout.contains("then reduced in"), "{}", r.stdout);
+    assert_eq!(counterexample_input(&p), "3\n10 20 30\n");
+}
+
 // ---- hints -------------------------------------------------------------------------------
 
 #[test]

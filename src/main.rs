@@ -7,6 +7,7 @@ mod generate;
 mod hints;
 mod infer;
 mod interactive;
+mod reduce;
 mod report;
 mod runner;
 mod schema;

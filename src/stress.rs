@@ -34,10 +34,11 @@ use crate::{
     compare::compare_outputs,
     generate,
     interactive::{self, Program},
-    report,
+    reduce, report,
     runner::{Limits, RunError, run_once, violation},
     schema::{Domains, Schema},
 };
+use crate::infer;
 
 pub const DEFAULT_ITERS: u32 = 1000;
 pub const DEFAULT_MAX_SIZE: u32 = 20;
@@ -199,11 +200,22 @@ pub async fn evaluate(env: &Env, seed: u64, size: u32) -> Evaluation {
             return Evaluation { seed, size, input: Vec::new(), failure: Some(Failure::Problem(problem)) };
         }
     };
-    let failure = match &env.oracle {
-        Oracle::Brute { brute, checker } => judge_against_brute(env, &input, brute, checker.as_deref()).await,
-        Oracle::Interactor { interactor } => judge_by_interactor(env, &input, interactor).await,
-    };
+    let failure = judge(env, &input).await;
     Evaluation { seed, size, input, failure }
+}
+
+/// Judges a given test (rather than a generated one). `seed` and `size` are only carried along.
+pub async fn evaluate_input(env: &Env, seed: u64, size: u32, input: Vec<u8>) -> Evaluation {
+    let _permit = env.permits.acquire().await.expect("semaphore is never closed");
+    let failure = judge(env, &input).await;
+    Evaluation { seed, size, input, failure }
+}
+
+async fn judge(env: &Env, input: &[u8]) -> Option<Failure> {
+    match &env.oracle {
+        Oracle::Brute { brute, checker } => judge_against_brute(env, input, brute, checker.as_deref()).await,
+        Oracle::Interactor { interactor } => judge_by_interactor(env, input, interactor).await,
+    }
 }
 
 async fn make_test(env: &Env, seed: u64, size: u32) -> Result<Vec<u8>, Problem> {
@@ -324,17 +336,35 @@ async fn judge_by_interactor(env: &Env, input: &[u8], interactor: &Path) -> Opti
 
 // ---- searching ---------------------------------------------------------------------------
 
+/// What a trial returned, as far as the search is concerned: did it find what it looks for?
+pub trait Failing {
+    fn failed(&self) -> bool;
+}
+
+impl Failing for Evaluation {
+    fn failed(&self) -> bool {
+        self.failure.is_some()
+    }
+}
+
+impl Failing for bool {
+    fn failed(&self) -> bool {
+        *self
+    }
+}
+
 /// Runs `trial` for every index in `range`, `chunk` at a time (each chunk in parallel), and
 /// returns the failure with the lowest index. Stops after the first chunk that has one.
-pub async fn first_failure<F, Fut>(
+pub async fn first_failure<T, F, Fut>(
     range: Range<u32>,
     chunk: u32,
     mut progress: impl FnMut(u32),
     trial: F,
-) -> Option<(u32, Evaluation)>
+) -> Option<(u32, T)>
 where
+    T: Failing + Send + 'static,
     F: Fn(u32) -> Fut,
-    Fut: Future<Output = Evaluation> + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
 {
     let mut start = range.start;
     while start < range.end {
@@ -344,11 +374,11 @@ where
             let future = trial(index);
             tasks.spawn(async move { (index, future.await) });
         }
-        let mut lowest: Option<(u32, Evaluation)> = None;
+        let mut lowest: Option<(u32, T)> = None;
         while let Some(joined) = tasks.join_next().await {
-            let (index, evaluation) = joined.expect("an evaluation task panicked");
-            if evaluation.failure.is_some() && lowest.as_ref().is_none_or(|(best, _)| index < *best) {
-                lowest = Some((index, evaluation));
+            let (index, outcome) = joined.expect("an evaluation task panicked");
+            if outcome.failed() && lowest.as_ref().is_none_or(|(best, _)| index < *best) {
+                lowest = Some((index, outcome));
             }
         }
         if lowest.is_some() {
@@ -385,6 +415,47 @@ where
         }
     }
     None
+}
+
+/// The most candidate inputs tried while reducing one counterexample.
+const MAX_REDUCE_EVALUATIONS: usize = 5000;
+
+pub struct Reduced {
+    pub input: String,
+    /// How many reducing steps were accepted.
+    pub rounds: usize,
+}
+
+/// Makes a failing input simpler without leaving the input format or its constraints: fewer
+/// repetitions, smaller numbers, simpler strings (see [`reduce`]). `trial` says whether a candidate
+/// input still fails in the same way. Returns `None` if the input does not fit the format.
+pub async fn reduce_input<F, Fut>(schema: &Schema, domains: &Domains, input: &str, chunk: u32, trial: F) -> Option<Reduced>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = bool> + Send + 'static,
+{
+    let sample = infer::tokenize(input).ok()?;
+    let mut doc = reduce::parse(schema, &sample).ok()?;
+    let (mut text, mut rounds, mut evaluated) = (reduce::render(schema, &doc), 0, 0);
+
+    while evaluated < MAX_REDUCE_EVALUATIONS {
+        let candidates = reduce::candidates(schema, domains, &doc);
+        if candidates.is_empty() {
+            break;
+        }
+        let texts: Vec<String> = candidates.iter().map(|(_, text)| text.clone()).collect();
+        let found = first_failure(0..texts.len() as u32, chunk, |_| {}, |i| trial(texts[i as usize].clone())).await;
+        match found {
+            Some((index, _)) => {
+                let tried = ((index / chunk.max(1) + 1) * chunk.max(1)) as usize;
+                evaluated += tried.min(texts.len());
+                (doc, text) = candidates.into_iter().nth(index as usize).expect("an index of the candidates");
+                rounds += 1;
+            }
+            None => break,
+        }
+    }
+    Some(Reduced { input: text, rounds })
 }
 
 // ---- running a whole stress test -------------------------------------------------------------
@@ -483,8 +554,33 @@ pub async fn run(setup: Setup) -> io::Result<ExitCode> {
         }
     }
 
+    // With the input format known, reduce the values too: shorter lengths, smaller numbers.
+    let mut reduced_rounds = 0;
+    if class != Class::System
+        && let Generator::Inferred { schema, domains } = &env.generator
+    {
+        let (seed, size) = (best.seed, best.size);
+        let trial_env = Arc::clone(&env);
+        let reduced = reduce_input(schema, domains, &String::from_utf8_lossy(&best.input), chunk, move |text| {
+            let env = Arc::clone(&trial_env);
+            async move {
+                let evaluation = evaluate_input(&env, seed, size, text.into_bytes()).await;
+                evaluation.failure.as_ref().is_some_and(|f| f.class() == class)
+            }
+        })
+        .await;
+        if let Some(reduced) = reduced.filter(|r| r.rounds > 0) {
+            // Run the reduced input once more, to have what the solution and the oracle said about it.
+            let again = evaluate_input(&env, seed, size, reduced.input.into_bytes()).await;
+            if again.failure.as_ref().is_some_and(|f| f.class() == class) {
+                reduced_rounds = reduced.rounds;
+                best = again;
+            }
+        }
+    }
+
     let Some(Failure::Fault(fault)) = &best.failure else { unreachable!("only solution faults are shrunk") };
-    print_counterexample(&env, iteration, shrunk_from, &best, fault, verifier);
+    print_counterexample(&env, iteration, shrunk_from, reduced_rounds, &best, fault, verifier);
     write_counterexample_files(&workdir, &best, fault)?;
     if save {
         let expected = match fault {
@@ -531,7 +627,15 @@ fn print_problem(problem: &Problem, evaluation: &Evaluation, generator: &Generat
     println!("{}", "This is a problem with the setup, not a counterexample.".yellow());
 }
 
-fn print_counterexample(env: &Env, iteration: u32, shrunk_from: Option<u32>, found: &Evaluation, fault: &Fault, verifier: &str) {
+fn print_counterexample(
+    env: &Env,
+    iteration: u32,
+    shrunk_from: Option<u32>,
+    reduced_rounds: usize,
+    found: &Evaluation,
+    fault: &Fault,
+    verifier: &str,
+) {
     match shrunk_from {
         Some(from) => println!(
             "{}",
@@ -543,6 +647,9 @@ fn print_counterexample(env: &Env, iteration: u32, shrunk_from: Option<u32>, fou
             "{}",
             format!("❌ Counterexample found at test #{} (seed {}, size {})", iteration + 1, found.seed, found.size).red().bold()
         ),
+    }
+    if reduced_rounds > 0 {
+        println!("   then reduced in {reduced_rounds} step(s): shorter lengths, fewer repetitions, smaller values");
     }
     report::print_block("Input", &report::truncate_for_display(&String::from_utf8_lossy(&found.input)));
 
@@ -773,6 +880,94 @@ mod tests {
         };
         let smaller = find_smaller(&plan(), 8, 12, Class::Wrong, broken_generator).await.expect("size 5 fails");
         assert_eq!(smaller.size, 5);
+    }
+
+    // ---- reduce_input -------------------------------------------------------------------------
+
+    fn schema_of(lines: &[&str]) -> Schema {
+        Schema::parse(lines).unwrap()
+    }
+
+    fn domains_of(pairs: &[(&str, &str)]) -> Domains {
+        pairs.iter().map(|(n, t)| (n.to_string(), crate::schema::Spec::parse(t).unwrap())).collect()
+    }
+
+    /// The numbers in a text, line by line.
+    fn rows(text: &str) -> Vec<Vec<i64>> {
+        text.lines().map(|l| l.split_whitespace().map(|t| t.parse().unwrap()).collect()).collect()
+    }
+
+    async fn reduced(schema: &Schema, domains: &Domains, input: &str, fails: fn(&str) -> bool) -> Reduced {
+        reduce_input(schema, domains, input, 4, move |text| async move { fails(&text) }).await.expect("the input fits")
+    }
+
+    #[tokio::test]
+    async fn an_input_shrinks_to_the_least_that_still_fails() {
+        // Fails when there are at least three numbers: the shortest and simplest is three ones.
+        let (s, d) = (schema_of(&["n", "a[n]"]), domains_of(&[("n", "1..size"), ("a", "1..9")]));
+        let r = reduced(&s, &d, "7\n9 8 7 6 5 4 3\n", |t| rows(t)[0][0] >= 3).await;
+        assert_eq!(r.input, "3\n1 1 1\n");
+        assert!(r.rounds > 0);
+    }
+
+    #[tokio::test]
+    async fn values_stop_at_the_smallest_that_still_fails() {
+        // Fails when some number is at least 4: one number, and exactly 4.
+        let (s, d) = (schema_of(&["n", "a[n]"]), domains_of(&[("n", "1..size"), ("a", "1..9")]));
+        let r = reduced(&s, &d, "5\n9 1 2 8 3\n", |t| rows(t)[1].iter().any(|&v| v >= 4)).await;
+        assert_eq!(r.input, "1\n4\n");
+    }
+
+    #[tokio::test]
+    async fn the_constraints_are_respected_all_the_way_down() {
+        // The numbers must be 5 to 9, so the least is 5, never 0 or 1.
+        let (s, d) = (schema_of(&["n", "a[n]"]), domains_of(&[("n", "2..size"), ("a", "5..9")]));
+        let r = reduced(&s, &d, "4\n9 8 7 6\n", |t| rows(t)[1].iter().sum::<i64>() >= 10).await;
+        assert_eq!(r.input, "2\n5 5\n");
+    }
+
+    #[tokio::test]
+    async fn a_failing_test_can_be_pulled_out_of_a_multitest() {
+        // Only a test with n = 2 fails; the other tests of the file are dropped, wherever it is.
+        let (s, d) = (schema_of(&["t", "repeat t {", "  n", "  a[n]", "}"]), domains_of(&[("t", "1..5"), ("n", "1..size"), ("a", "1..9")]));
+        let r = reduced(&s, &d, "4\n1\n5\n3\n6 7 8\n2\n9 9\n1\n4\n", |t| {
+            let lines: Vec<&str> = t.lines().collect();
+            lines.iter().skip(1).step_by(2).any(|l| l.trim() == "2")
+        })
+        .await;
+        assert_eq!(r.input, "1\n2\n1 1\n");
+    }
+
+    #[tokio::test]
+    async fn an_input_that_cannot_be_simpler_is_returned_as_it_is() {
+        let (s, d) = (schema_of(&["n", "a[n]"]), domains_of(&[("n", "1..size"), ("a", "1..9")]));
+        let r = reduced(&s, &d, "1\n1\n", |_| true).await;
+        assert_eq!((r.input.as_str(), r.rounds), ("1\n1\n", 0));
+    }
+
+    #[tokio::test]
+    async fn a_reduction_that_would_stop_failing_is_not_taken() {
+        // Fails only for exactly 5 numbers: nothing shorter qualifies, and values may all drop.
+        let (s, d) = (schema_of(&["n", "a[n]"]), domains_of(&[("n", "1..size"), ("a", "1..9")]));
+        let r = reduced(&s, &d, "5\n9 8 7 6 5\n", |t| rows(t)[0][0] == 5).await;
+        assert_eq!(r.input, "5\n1 1 1 1 1\n");
+    }
+
+    #[tokio::test]
+    async fn a_permutation_stays_one() {
+        let (s, d) = (schema_of(&["n", "p[n]"]), domains_of(&[("n", "1..size"), ("p", "perm")]));
+        let r = reduced(&s, &d, "6\n4 6 2 5 1 3\n", |t| rows(t)[0][0] >= 3).await;
+        let numbers = &rows(&r.input)[1];
+        let mut sorted = numbers.clone();
+        sorted.sort();
+        assert_eq!(sorted, (1..=numbers.len() as i64).collect::<Vec<_>>(), "{}", r.input);
+        assert_eq!(numbers.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_input_that_does_not_fit_the_format_is_not_reduced() {
+        let (s, d) = (schema_of(&["n", "a[n]"]), domains_of(&[("n", "1..size"), ("a", "1..9")]));
+        assert!(reduce_input(&s, &d, "3\n1 2\n", 4, |_| async { true }).await.is_none());
     }
 
     // ---- explain ----------------------------------------------------------------------

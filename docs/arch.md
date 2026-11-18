@@ -136,6 +136,8 @@ With `"interactive": true` each test runs the solution against `<solution>_inter
    or the checker, or, for an interactive problem, the interactor. Sizes ramp from 1 to `maxSize`.
 2. `first_failure` runs iterations in parallel chunks and returns the lowest failing index.
 3. `find_smaller` shrinks a fault by trying smaller sizes with many seeds for a failure of the same kind.
+   For the inferred generator, `reduce_input` then reduces the values (`reduce.rs`): lengths, repetitions and
+   numbers, one valid edit at a time, keeping an edit only if the same kind of failure remains.
 4. The counterexample is printed and kept in `target/judge/stress/`; `--save` appends it to the `.prob`.
 
 A failure is either a `Fault` of the solution (wrong answer, PE, TLE, MLE, RE) or a `Problem` with the
@@ -157,6 +159,9 @@ Without a generator file a stress test makes its tests inside the judge:
   hints, validates the result, and warns about samples that break the final constraints.
 - `generate.rs` makes a test from a format, constraints, a seed and a size (a splitmix64 generator), limiting
   size variables to the size of the test and refusing impossible constraints or runaway inputs.
+- `reduce.rs` takes a failing input apart into a tree of values and offers single simplifying edits
+  (drop a repetition, lower a number, zero an array, simplify a character), each re-normalized so lengths follow
+  their numbers and values stay in their constraints, and checked to be a valid input.
 - `constraints.rs` is the `--ask-constraints` dialogue (input and output are passed in, so it is tested with
   scripted answers) and saving the answers into `<solution>.stress.json`.
 
@@ -189,6 +194,7 @@ Hints come from an optional `"stress"` object in the `.prob` and from a sidecar 
 | `src/schema.rs` | `Schema` and `Spec` (format and constraints: parse, print, validate), `Expr`, `Env` |
 | `src/infer.rs` | `infer_structure`, `observe`, `default_domains`, `build` |
 | `src/generate.rs` | `generate`, `Rng` |
+| `src/reduce.rs` | `parse`/`render` (an input as a tree of values), `normalize`, `candidates` |
 | `src/constraints.rs` | `ask`, `confirm`, `save` |
 | `src/cli.rs` | `parse`, `USAGE` |
 | `src/hints.rs` | `Hints`, `load` (the `.prob` object and the sidecar file) |

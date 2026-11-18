@@ -80,16 +80,16 @@ pub fn tokenize(text: &str) -> Result<Sample, String> {
     Ok(lines)
 }
 
-fn all_ints(line: &[Token]) -> bool {
+pub(crate) fn all_ints(line: &[Token]) -> bool {
     line.iter().all(|t| matches!(t, Token::Int(_)))
 }
 
-fn ints(line: &[Token]) -> Vec<i64> {
+pub(crate) fn ints(line: &[Token]) -> Vec<i64> {
     line.iter().filter_map(|t| if let Token::Int(n) = t { Some(*n) } else { None }).collect()
 }
 
 /// The single word on a line, if that is all it holds.
-fn only_word(line: &[Token]) -> Option<&str> {
+pub(crate) fn only_word(line: &[Token]) -> Option<&str> {
     match line {
         [Token::Word(w)] => Some(w),
         _ => None,

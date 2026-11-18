@@ -123,7 +123,7 @@ your `_checker`, if you have one, which is the right choice when several answers
 up to `--max-size`, so small inputs, which make the clearest counterexamples, are tried first.
 
 When a test fails, the judge searches smaller sizes, with many seeds each, for a failure of the same kind and
-shows the smallest one it finds: the input, what the brute force and your solution printed, and the command that
+shows the smallest one it finds (with the inferred generator it then also simplifies the values, see below): the input, what the brute force and your solution printed, and the command that
 regenerates the input. For an interactive problem the interactor is the oracle and no brute force is needed.
 
 | Option | Meaning |
@@ -165,6 +165,13 @@ and a number that sets a length or count grows with the size of the test (`1..si
 first. If the samples fit more than one shape, the choice made is reported, and more samples settle it. Things
 it cannot understand (non-integer numbers, blank lines inside the input, lines mixing numbers and words) are
 refused with the line number, and so are samples that do not follow one format.
+
+**Reducing the counterexample.** The input of a small failing test still holds whatever numbers the generator drew
+(`3` / `6 5 6`). With the format and constraints known, the judge then simplifies it one step at a time (drops a
+repetition, lowers a number, sets an array or a character to its simplest value) and keeps a step only if the
+input stays valid and the solution still fails in the same way, so you get the least input that fails (`3` /
+`1 1 1`), always within the constraints. This runs only for the inferred generator; the input of an `A_gen.rs` is
+shown as it made it.
 
 **Setting the constraints.** `--ask-constraints` asks about each variable in turn, showing the current constraint;
 Enter keeps it, `?` explains the syntax, and a wrong answer is explained and asked again:

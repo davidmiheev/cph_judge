@@ -1,6 +1,6 @@
 # Design: checker, interactive problems, and stress testing
 
-Status: **phases 0-4 done** (runner, CPU-time limits, `_checker`, interactive problems, stress testing with a hand-written or an inferred generator, `--ask-constraints`); only schema-aware shrinking (phase 5) is planned. See [Phases](#phases).
+Status: **all phases done** (runner and CPU-time limits, `_checker`, interactive problems, stress testing with a hand-written or an inferred generator, `--ask-constraints`, schema-aware shrinking). What is left is in `todo.md`. See [Phases](#phases).
 
 All three features are the same machine with different inputs and a different
 oracle (the thing that decides pass/fail):
@@ -253,6 +253,30 @@ Defaults for the constraints stay inside what the samples show:
   more, `distinct` and `sorted` for four or more.
 - Strings use the characters that were seen.
 
+### Reducing the counterexample (`src/reduce.rs`, phase 5)
+
+Searching smaller sizes finds a small test, not a clean one: its numbers are whatever the generator drew
+(`3` / `6 5 6`). With the format and constraints known, the failing input is parsed into a tree of values and
+reduced one edit at a time, each edit kept only if the result is still a valid input and the solution still
+fails **in the same way** (the same kind check as shrinking by size):
+
+- drop one repetition of a block counted by a number (any one, not only the last: the failing test of a
+  multitest can be the third), lowering that number to match;
+- lower a number to its constraint's lower bound, half way, or by one;
+- set a whole array to its lower bound, then single elements to it or half way;
+- set a character of a string to the first character of its alphabet.
+
+After each edit lengths and counts are evaluated again and arrays, strings and repetitions cut to them, values
+are pulled back into their constraints, and a permutation that was shortened keeps only the values that still
+fit. A candidate must then read back under the format with no constraint broken, so `distinct`, `sorted` and
+`perm` survive every step. Candidates are tried in parallel chunks and the lowest one that still fails is taken
+(so the result is repeatable); this repeats until nothing simpler fails or 5000 candidates have been tried.
+The result is the least input that fails: for the sum example, `3` and `1 1 1`; with `a: 5..9`, `3` and `5 5 5`.
+
+It applies only to the inferred generator, which is what supplies the format and the constraints that make
+"still valid" decidable; the input of a hand-written generator is shown as it made it. `--save` saves the
+reduced input.
+
 ### Staying safe
 
 - **Refuse instead of guessing.** Non-integer numbers, blank lines inside the input, lines mixing numbers
@@ -323,4 +347,4 @@ exists so the hints survive if it does not.
 | 2 | Interactive mode, reusing phase 1 machinery | **done** |
 | 3 | Stress with `_gen` / `_brute`, ramping, size-based shrinking, `--save`, hints and sidecar | **done** |
 | 4 | Schema inference and built-in generator, `--show-schema`, `--ask-constraints` | **done** |
-| 5 | Schema-aware shrinking | planned |
+| 5 | Schema-aware shrinking | **done** |
