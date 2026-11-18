@@ -12,6 +12,7 @@ A fast, concurrent competitive programming judge written in Rust, designed to wo
   - **Time Limits (TLE)**: Judged on CPU time and enforced live (Linux), with a wall-clock cap and process-tree cleanup for hung processes.
   - **Memory Limits (MLE)**: Peak resident set size tracking using `wait4` / `rusage`.
   - **Runtime Errors (RE)**: Robust exit code and signal failure detection.
+- **Stress Testing**: `--stress` hunts for a counterexample with your own generator and brute force (or interactor), shrinks it, and can save it as a test.
 - **Interactive Problems**: Put a `<solution>_interactor.rs` next to your solution; the judge connects the two with pipes and takes the verdict from the interactor.
 - **Custom Checkers**: Drop a `<solution>_checker.rs` next to your solution to judge problems with several valid answers (testlib-style protocol).
 - **Tokenized & Float-Aware Comparison**: Token-by-token comparison with automatic floating-point epsilon tolerance ($\epsilon = 10^{-6}$) and whitespace insensitivity.
@@ -38,7 +39,7 @@ cargo test
 ## Usage
 
 ```bash
-cargo run --release -- <search_dir> <problem_name>
+cargo run --release -- <search_dir> <problem_name> [--stress [--iters N] [--seed S] [--max-size N] [--save]]
 ```
 
 ### Example
@@ -106,6 +107,53 @@ checkers, interactors are written in Rust for now and cannot be built if `Cargo.
 
 The interactor's input file for test N is kept in `<project>/target/judge/N.in`.
 
+### Stress testing
+
+To look for an input on which your solution is wrong, add a brute-force solution and a generator next to it:
+`A.rs` is stressed with `A_brute.rs` (slow but obviously right) and `A_gen.rs`. Then:
+
+```bash
+cargo run --release -- <search_dir> <problem_name> --stress
+```
+
+Each test is made by running `A_gen <seed> <size>`, which must print one test to stdout and make it larger as
+`size` grows. The judge runs the brute force and the solution on it and compares the outputs (or hands them to
+your `_checker`, if you have one, which is the right choice when several answers are valid). Sizes grow from 1
+up to `--max-size`, so small inputs, which make the clearest counterexamples, are tried first.
+
+When a test fails, the judge searches smaller sizes, with many seeds each, for a failure of the same kind and
+shows the smallest one it finds: the input, what the brute force and your solution printed, and the command that
+regenerates the input. For an interactive problem the interactor is the oracle and no brute force is needed.
+
+| Option | Meaning |
+|---|---|
+| `--iters N` | number of tests (default 1000) |
+| `--seed S` | seed of the first test; the same seed repeats the run exactly (a fresh seed is printed otherwise) |
+| `--max-size N` | largest size given to the generator (default 20) |
+| `--save` | append the counterexample to the `.prob` as a new test, so the normal judge runs it from then on |
+
+The exit code is `0` if no counterexample was found, `1` if one was, and `2` if something in the setup is wrong. A
+generator that crashes or prints nothing, a brute force that fails on a generated input (the input may be invalid,
+or the size too big for the brute force), and a checker that rejects the brute force's own answer are reported as
+problems with the setup, never as counterexamples. The counterexample is also kept in
+`<project>/target/judge/stress/counterexample.in` (and `.out` / `.ans`).
+
+`--save` rewrites the `.prob` as compact JSON with its keys in alphabetical order; nothing else about it changes.
+
+#### Hints
+
+File names and defaults can be set in a `"stress"` object in the `.prob` file, or in a `A.stress.json` next to the
+solution, which wins where both set a field. Relative paths are resolved against the solution's directory, and a
+file that is named but missing is an error.
+
+```json
+"stress": { "brute": "tools/slow.rs", "gen": "tools/make.rs", "checker": "my_checker.rs",
+            "interactor": "talk.rs", "iters": 500, "maxSize": 12, "shrinkSeeds": 100 }
+```
+
+`checker` and `interactor` apply to ordinary judging too. Command-line options win over hints. Whether the CPH
+editor keeps unknown keys when it rewrites the `.prob` has not been checked, which is what the sidecar file is for.
+
 ---
 
 ## Verdicts
@@ -123,7 +171,7 @@ The interactor's input file for test N is kept in `<project>/target/judge/N.in`.
 ## Documentation
 
 - **[Architecture](docs/arch.md)**: Detailed system design, execution pipeline, and comparison engine.
-- **[Checker, Interactive & Stress Design](docs/design-stress-interactive.md)**: Plan for `_checker`, interactive problems, and stress testing.
+- **[Checker, Interactive & Stress Design](docs/design-stress-interactive.md)**: Design of `_checker`, interactive problems, and stress testing, and the plan for the inferred generator.
 - **[Roadmap & Backlog](docs/todo.md)**: Current development state and upcoming features.
 - **[Code Analysis](docs/analysis.md)**: Breakdown of components and evolution.
 

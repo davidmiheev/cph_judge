@@ -16,6 +16,10 @@ use std::{
 pub const CHECKER_BIN: &str = "__judge_checker";
 /// Name of the Cargo binary built from the user's `<solution>_interactor.rs`.
 pub const INTERACTOR_BIN: &str = "__judge_interactor";
+/// Name of the Cargo binary built from the user's `<solution>_brute.rs`.
+pub const BRUTE_BIN: &str = "__judge_brute";
+/// Name of the Cargo binary built from the user's `<solution>_gen.rs`.
+pub const GENERATOR_BIN: &str = "__judge_gen";
 
 #[derive(Deserialize)]
 struct CargoToml {
@@ -63,6 +67,21 @@ pub fn aux_path(src_path: &Path, kind: &str) -> PathBuf {
 /// The auxiliary source of this kind, if the file exists.
 pub fn aux_source(src_path: &Path, kind: &str) -> Option<PathBuf> {
     Some(aux_path(src_path, kind)).filter(|path| path.is_file())
+}
+
+/// Like [`aux_source`], but a hint that names the file explicitly takes precedence. A
+/// relative hint is resolved against the solution's directory; a hint naming a file that
+/// does not exist is an error rather than a silent fallback to the suffix convention.
+pub fn aux_file(src_path: &Path, kind: &str, hint: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(hint) = hint else {
+        return Ok(aux_source(src_path, kind));
+    };
+    let path = src_path.parent().unwrap_or_else(|| Path::new("")).join(hint);
+    if path.is_file() {
+        Ok(Some(path))
+    } else {
+        Err(format!("the `{kind}` hint names {}, which does not exist", path.display()))
+    }
 }
 
 /// Judge-owned source files placed in the project's `src/bin/` while it is built.
@@ -165,6 +184,37 @@ mod tests {
         fs::write(dir.join("sol_checker"), "").unwrap();
         assert_eq!(aux_source(&dir.join("A.test.rs"), "checker"), Some(dir.join("A.test_checker.rs")));
         assert_eq!(aux_source(&dir.join("sol"), "checker"), Some(dir.join("sol_checker")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn aux_file_without_a_hint_follows_the_suffix_convention() {
+        let dir = scratch("aux_file_default");
+        fs::write(dir.join("A_brute.rs"), "").unwrap();
+        assert_eq!(aux_file(&dir.join("A.rs"), "brute", None), Ok(Some(dir.join("A_brute.rs"))));
+        assert_eq!(aux_file(&dir.join("A.rs"), "gen", None), Ok(None));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn aux_file_hint_wins_over_the_suffix_and_is_relative_to_the_solution() {
+        let dir = scratch("aux_file_hint");
+        fs::write(dir.join("A_brute.rs"), "").unwrap();
+        fs::create_dir_all(dir.join("tools")).unwrap();
+        fs::write(dir.join("tools/slow.rs"), "").unwrap();
+        assert_eq!(aux_file(&dir.join("A.rs"), "brute", Some("tools/slow.rs")), Ok(Some(dir.join("tools/slow.rs"))));
+        // An absolute hint is used as it is.
+        let absolute = dir.join("tools/slow.rs");
+        assert_eq!(aux_file(&dir.join("A.rs"), "brute", absolute.to_str()), Ok(Some(absolute.clone())));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn aux_file_hint_naming_a_missing_file_is_an_error() {
+        let dir = scratch("aux_file_missing");
+        fs::write(dir.join("A_brute.rs"), "").unwrap(); // would be found by suffix, but the hint says otherwise
+        let error = aux_file(&dir.join("A.rs"), "brute", Some("nope.rs")).unwrap_err();
+        assert!(error.contains("`brute` hint") && error.contains("nope.rs"), "{error}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

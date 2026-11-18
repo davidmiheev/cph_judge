@@ -15,6 +15,84 @@ pub const CARGO_TOML: &str = "[package]\nname = \"proj\"\nversion = \"0.1.0\"\ne
 pub const CARGO_TOML_NO_AUTOBINS: &str = "[package]\nname = \"proj\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautobins = false\n\
      [[bin]]\nname = \"proj\"\npath = \"src/main.rs\"\n";
 
+/// Exit codes follow testlib: 0 OK, 1 WA, 2 PE.
+pub const GUESS_INTERACTOR: &str = r#"
+use std::io::{self, BufRead, Write};
+use std::process::exit;
+
+fn main() {
+    let path = std::env::args().nth(1).expect("input file argument");
+    let secret: i64 = std::fs::read_to_string(path).unwrap().trim().parse().unwrap();
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut out = io::stdout();
+    for _ in 0..25 {
+        let mut line = String::new();
+        if input.read_line(&mut line).unwrap() == 0 {
+            // Let the judge see which side stopped first.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            eprintln!("unexpected EOF");
+            exit(1);
+        }
+        let line = line.trim();
+        if let Some(x) = line.strip_prefix("? ") {
+            let x: i64 = x.parse().unwrap();
+            let reply = if x < secret { "<" } else if x > secret { ">" } else { "=" };
+            writeln!(out, "{reply}").unwrap();
+            out.flush().unwrap();
+        } else if let Some(x) = line.strip_prefix("! ") {
+            let x: i64 = x.parse().unwrap();
+            if x == secret {
+                exit(0);
+            }
+            eprintln!("wrong answer: {x} is not the secret");
+            exit(1);
+        } else {
+            eprintln!("unknown command {line:?}");
+            exit(2);
+        }
+    }
+    eprintln!("too many queries");
+    exit(1);
+}
+"#;
+
+/// Binary search over 1..=1_000_000: about 20 queries.
+pub const GUESS_SOLUTION: &str = r#"
+use std::io::{self, BufRead, Write};
+
+fn main() {
+    let (mut lo, mut hi) = (1i64, 1_000_000i64);
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut out = io::stdout();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        writeln!(out, "? {mid}").unwrap();
+        out.flush().unwrap();
+        let mut reply = String::new();
+        input.read_line(&mut reply).unwrap();
+        if reply.trim() == "<" { lo = mid + 1 } else { hi = mid }
+    }
+    writeln!(out, "! {lo}").unwrap();
+    out.flush().unwrap();
+}
+"#;
+
+
+/// A small xorshift generator for the example generators, so they need no crates.
+pub const RNG: &str = r#"
+fn rng(seed: u64) -> impl FnMut() -> u64 {
+    let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) | 1;
+    move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    }
+}
+"#;
+
 pub fn solution_printing(line: &str) -> String {
     format!("fn main() {{ println!(\"{line}\"); }}\n")
 }
@@ -62,26 +140,40 @@ impl Project {
         self.write("sol/A_interactor.rs", code)
     }
 
+    pub fn brute(&self, code: &str) -> &Self {
+        self.write("sol/A_brute.rs", code)
+    }
+
+    pub fn generator(&self, code: &str) -> &Self {
+        self.write("sol/A_gen.rs", code)
+    }
+
     /// Writes `.cph/p.prob` for an ordinary problem with the given `(input, expected output)` tests.
     pub fn problem(&self, tests: &[(&str, &str)]) -> &Self {
-        self.prob(tests, false, 5000)
+        self.prob(tests, false, 5000, None)
+    }
+
+    /// Like [`problem`](Self::problem), with a `"stress"` hints object (given as JSON) in the `.prob`.
+    pub fn problem_with_hints(&self, tests: &[(&str, &str)], hints_json: &str) -> &Self {
+        self.prob(tests, false, 5000, Some(hints_json))
     }
 
     /// Writes `.cph/p.prob` for an interactive problem. The tests' inputs are what the
     /// interactor reads; their stored outputs are unused.
     pub fn interactive_problem(&self, inputs: &[&str], time_limit_ms: u64) -> &Self {
         let tests: Vec<(&str, &str)> = inputs.iter().map(|input| (*input, "")).collect();
-        self.prob(&tests, true, time_limit_ms)
+        self.prob(&tests, true, time_limit_ms, None)
     }
 
-    fn prob(&self, tests: &[(&str, &str)], interactive: bool, time_limit_ms: u64) -> &Self {
+    fn prob(&self, tests: &[(&str, &str)], interactive: bool, time_limit_ms: u64, hints_json: Option<&str>) -> &Self {
         let tests: Vec<String> = tests
             .iter()
             .map(|(input, output)| format!("{{\"input\":{},\"output\":{}}}", json_string(input), json_string(output)))
             .collect();
+        let hints = hints_json.map(|json| format!(",\"stress\":{json}")).unwrap_or_default();
         let prob = format!(
             "{{\"name\":\"p\",\"interactive\":{interactive},\"timeLimit\":{time_limit_ms},\"memoryLimit\":256,\
-             \"srcPath\":{},\"tests\":[{}]}}",
+             \"srcPath\":{}{hints},\"tests\":[{}]}}",
             json_string(self.root.join("sol/A.rs").to_str().unwrap()),
             tests.join(",")
         );
@@ -89,7 +181,17 @@ impl Project {
     }
 
     pub fn run(&self) -> Judged {
-        self.judge(Command::new(env!("CARGO_BIN_EXE_cph_judge")).arg(&self.root).arg("p"))
+        self.run_with(&[])
+    }
+
+    /// Runs the judge with extra command-line arguments after the project and problem name.
+    pub fn run_with(&self, extra: &[&str]) -> Judged {
+        self.judge(Command::new(env!("CARGO_BIN_EXE_cph_judge")).arg(&self.root).arg("p").args(extra))
+    }
+
+    /// The `.prob` file as parsed JSON.
+    pub fn prob_json(&self) -> String {
+        fs::read_to_string(self.root.join(".cph/p.prob")).unwrap()
     }
 
     /// Like [`run`](Self::run), but names the project by a path relative to the judge's

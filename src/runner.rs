@@ -71,6 +71,18 @@ pub struct RunOutput {
     pub max_rss: u64,
 }
 
+impl RunError {
+    /// A short description, for messages that are not the per-test verdict line.
+    pub fn describe(&self) -> String {
+        match self {
+            RunError::Tle => "time limit exceeded".to_string(),
+            RunError::Mle => "memory limit exceeded".to_string(),
+            RunError::Re { status, .. } => format!("runtime error ({})", format_exit_status(*status)),
+            RunError::System(e) => e.clone(),
+        }
+    }
+}
+
 /// Which limit, if any, a finished process broke. Precedence: TLE, then RE, then MLE.
 pub fn violation(
     status: ExitStatus,

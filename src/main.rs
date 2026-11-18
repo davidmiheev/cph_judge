@@ -1,8 +1,12 @@
 mod checker;
+mod cli;
 mod compare;
 mod compile;
+mod hints;
 mod interactive;
+mod report;
 mod runner;
+mod stress;
 
 use colored::*;
 use ignore::WalkBuilder;
@@ -19,8 +23,9 @@ use tokio::sync::Semaphore;
 use checker::run_checker;
 use compare::compare_outputs;
 use compile::BuildOutcome;
+use hints::Hints;
 use interactive::{Outcome, Program};
-use runner::{Limits, RunError, RunOutput, format_exit_status, run_once};
+use runner::{Limits, RunError, RunOutput, run_once};
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -34,6 +39,9 @@ struct CphConfig {
     tests: Vec<Test>,
     #[serde(rename = "srcPath")]
     src_path: String,
+    /// Optional hints for the auxiliary files and stress testing; see [`hints`].
+    #[serde(default)]
+    stress: Option<Hints>,
 }
 
 #[derive(Deserialize)]
@@ -53,21 +61,47 @@ enum Verifier {
 }
 
 impl Verifier {
-    /// The source file and Cargo binary name to build, if there is anything to build.
-    fn bin(&self) -> Option<(&'static str, &Path)> {
-        match self {
-            Verifier::Builtin => None,
-            Verifier::Checker(src) => Some((compile::CHECKER_BIN, src)),
-            Verifier::Interactor(src) => Some((compile::INTERACTOR_BIN, src)),
-        }
-    }
-
     fn label(&self) -> &'static str {
         match self {
             Verifier::Builtin => "checker",
             Verifier::Checker(_) => "checker",
             Verifier::Interactor(_) => "interactor",
         }
+    }
+}
+
+/// A program the judge builds from a source file next to the solution.
+struct Aux {
+    label: &'static str,
+    /// Name of the Cargo binary it is built as.
+    bin: &'static str,
+    source: PathBuf,
+}
+
+/// The files that take part in a run, chosen from what is next to the solution and the hints.
+struct Files {
+    verifier: Verifier,
+    /// The brute-force solution, for a stress test of an ordinary problem.
+    brute: Option<PathBuf>,
+    /// The test generator, for a stress test.
+    generator: Option<PathBuf>,
+}
+
+impl Files {
+    fn aux(&self) -> Vec<Aux> {
+        let mut aux = Vec::new();
+        match &self.verifier {
+            Verifier::Builtin => {}
+            Verifier::Checker(source) => aux.push(Aux { label: "checker", bin: compile::CHECKER_BIN, source: source.clone() }),
+            Verifier::Interactor(source) => aux.push(Aux { label: "interactor", bin: compile::INTERACTOR_BIN, source: source.clone() }),
+        }
+        if let Some(source) = &self.brute {
+            aux.push(Aux { label: "brute force", bin: compile::BRUTE_BIN, source: source.clone() });
+        }
+        if let Some(source) = &self.generator {
+            aux.push(Aux { label: "generator", bin: compile::GENERATOR_BIN, source: source.clone() });
+        }
+        aux
     }
 }
 
@@ -206,27 +240,7 @@ fn print_outcome(test_label: &str, test: &Test, limits: &Limits, verifier: &str,
     let TestOutcome { run, judgement, note } = outcome;
     let mut accepted = false;
     match (run, judgement) {
-        (Err(RunError::Tle), _) => {
-            let limit_label = format!("{:.2}s", limits.time.as_secs_f32());
-            println!("{}  {} ({})", "⏱️".yellow(), format!("{} TLE", test_label).yellow(), limit_label);
-        }
-        (Err(RunError::Mle), _) => {
-            let limit_label = format!("{} MB", limits.memory_bytes / 1024 / 1024);
-            println!("{}  {} ({})", "💾".yellow(), format!("{} MLE", test_label).yellow(), limit_label);
-        }
-        (Err(RunError::Re { status, stderr }), _) => {
-            let status_desc = format_exit_status(status);
-            println!("{}  {} ({})", "💥".red(), format!("{} RE", test_label).red().bold(), status_desc.yellow());
-            let stderr_trimmed = stderr.trim();
-            if !stderr_trimmed.is_empty() {
-                println!("{}", "--- Stderr / Crash Trace ---".magenta());
-                println!("{}", stderr_trimmed);
-                println!("{}", "----------------------------".magenta());
-            }
-        }
-        (Err(RunError::System(e)), _) => {
-            println!("{}  {} ({})", "⚠️".red(), format!("{} Error", test_label).red(), e);
-        }
+        (Err(error), _) => report::print_run_error(test_label, limits, &error),
         (Ok(output), Some(Judgement::Accepted)) => {
             let mem_mb = output.max_rss as f64 / 1048576.0;
             println!("{} {} ({:.2?}, {:.2} MB)", "✅".green(), test_label.green(), output.cpu_time, mem_mb);
@@ -242,11 +256,11 @@ fn print_outcome(test_label: &str, test: &Test, limits: &Limits, verifier: &str,
         }
         (Ok(_), Some(Judgement::Wrong(Some(message)))) => {
             println!("{} {}", "❌".red(), test_label.red().bold());
-            print_verifier_message(verifier, &message);
+            report::print_verifier_message(verifier, &message);
         }
         (Ok(_), Some(Judgement::Presentation(message))) => {
             println!("{} {}", "❌".red(), format!("{} PE", test_label).red().bold());
-            print_verifier_message(verifier, &message);
+            report::print_verifier_message(verifier, &message);
         }
         (Ok(_), Some(Judgement::VerifierFailed(message))) => {
             println!("{}  {} ({})", "⚠️".red(), format!("{} {} failed", test_label, verifier).red(), message);
@@ -259,22 +273,9 @@ fn print_outcome(test_label: &str, test: &Test, limits: &Limits, verifier: &str,
     accepted
 }
 
-fn print_verifier_message(verifier: &str, message: &str) {
-    let mut title = verifier.to_string();
-    if let Some(first) = title.get_mut(..1) {
-        first.make_ascii_uppercase();
-    }
-    println!("{}", format!("--- {title} ---").blue());
-    if message.is_empty() {
-        println!("(no message)");
-    } else {
-        println!("{}", message);
-    }
-    println!("{}", "-".repeat(title.len() + 8).blue());
-}
-
-/// Exit codes: 0 = every test passed, 1 = compilation failed or a test failed,
-/// 2 = usage error or the judge itself could not run.
+/// Exit codes: 0 = every test passed (or a stress test found no counterexample), 1 = compilation
+/// failed, a test failed or a counterexample was found, 2 = usage error or the judge itself
+/// could not run.
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -290,12 +291,14 @@ fn file_name(path: &Path) -> String {
     path.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
-/// Picks the verifier from the files next to the solution and the problem's `interactive` flag.
-fn choose_verifier(src_path: &Path, interactive: bool) -> Result<Verifier, String> {
-    let checker = compile::aux_source(src_path, "checker");
-    let interactor = compile::aux_source(src_path, "interactor");
+/// Picks the files that take part in the run from what is next to the solution, the hints and
+/// the problem's `interactive` flag. `stress` additionally requires a generator, and a brute force
+/// unless the problem is interactive.
+fn choose_files(src_path: &Path, interactive: bool, hints: &Hints, stress: bool) -> Result<Files, String> {
+    let checker = compile::aux_file(src_path, "checker", hints.checker.as_deref())?;
+    let interactor = compile::aux_file(src_path, "interactor", hints.interactor.as_deref())?;
 
-    if interactive {
+    let verifier = if interactive {
         let Some(interactor) = interactor else {
             return Err(format!(
                 "the problem is marked interactive but no interactor was found; expected {}",
@@ -305,29 +308,68 @@ fn choose_verifier(src_path: &Path, interactive: bool) -> Result<Verifier, Strin
         if let Some(checker) = checker {
             println!("ℹ️  Ignoring checker {}: the interactor decides the verdict of an interactive problem", file_name(&checker));
         }
-        return Ok(Verifier::Interactor(interactor));
+        Verifier::Interactor(interactor)
+    } else {
+        if let Some(interactor) = interactor {
+            println!(
+                "ℹ️  Ignoring interactor {}: the problem is not marked interactive (`\"interactive\": true` in the .prob file)",
+                file_name(&interactor)
+            );
+        }
+        match checker {
+            Some(checker) => Verifier::Checker(checker),
+            None => Verifier::Builtin,
+        }
+    };
+
+    if !stress {
+        return Ok(Files { verifier, brute: None, generator: None });
     }
 
-    if let Some(interactor) = interactor {
-        println!(
-            "ℹ️  Ignoring interactor {}: the problem is not marked interactive (`\"interactive\": true` in the .prob file)",
-            file_name(&interactor)
-        );
-    }
-    Ok(match checker {
-        Some(checker) => Verifier::Checker(checker),
-        None => Verifier::Builtin,
-    })
+    let generator = compile::aux_file(src_path, "gen", hints.generator.as_deref())?.ok_or_else(|| {
+        format!(
+            "stress testing needs a generator; expected {} (or name one with the `gen` hint)",
+            compile::aux_path(src_path, "gen").display()
+        )
+    })?;
+    // An interactive problem has no brute force: the interactor knows the right answers.
+    let brute = if interactive {
+        None
+    } else {
+        Some(compile::aux_file(src_path, "brute", hints.brute.as_deref())?.ok_or_else(|| {
+            format!(
+                "stress testing needs a brute-force solution; expected {} (or name one with the `brute` hint)",
+                compile::aux_path(src_path, "brute").display()
+            )
+        })?)
+    };
+    Ok(Files { verifier, brute, generator: Some(generator) })
+}
+
+/// A seed for runs that were not given one: different every time, and printed so it can be repeated.
+fn fresh_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ (u64::from(std::process::id()) << 40)
 }
 
 async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: judge <search_dir> <problem_name>");
-        return Ok(ExitCode::from(2));
-    }
+    let args: Vec<String> = env::args().skip(1).collect();
+    let cli = match cli::parse(&args) {
+        Ok(cli::Parsed::Run(cli)) => cli,
+        Ok(cli::Parsed::Help) => {
+            println!("{}", cli::USAGE);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Err(message) => {
+            eprintln!("{} {}\n\n{}", "error:".red().bold(), message, cli::USAGE);
+            return Ok(ExitCode::from(2));
+        }
+    };
 
-    let prob_path = find_prob_file(&args[1], &args[2]).ok_or("Metadata file not found.")?;
+    let prob_path = find_prob_file(&cli.search_dir, &cli.problem).ok_or("Metadata file not found.")?;
     // Everything derived from this path (the project root, the binaries inside it) is used
     // as the program path of child processes started in the project root. A relative path
     // would then be resolved against the wrong directory.
@@ -338,15 +380,17 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let package = compile::package_info(project_root)?;
     let src_path = Path::new(&config.src_path);
-    let verifier = choose_verifier(src_path, config.interactive)?;
-    if let Some((_, source)) = verifier.bin()
+    let hints = hints::load(config.stress.clone(), src_path)?;
+    let files = choose_files(src_path, config.interactive, &hints, cli.stress)?;
+    let aux = files.aux();
+    if let Some(first) = aux.first()
         && !package.autobins
     {
         return Err(format!(
             "found {} but Cargo.toml sets `autobins = false`, so the judge cannot build it from src/bin/; \
              remove that setting or the {}",
-            source.display(),
-            verifier.label()
+            first.source.display(),
+            first.label
         )
         .into());
     }
@@ -356,10 +400,10 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     println!("🔨 Compiling {} ({})", package.name.bold(), "release".yellow());
     let mut bins = vec![package.name.as_str()];
     let mut generated: Vec<(&str, &Path)> = Vec::new();
-    if let Some((bin, source)) = verifier.bin() {
-        println!("🧪 Using {} {}", verifier.label(), file_name(source).bold().cyan());
-        bins.push(bin);
-        generated.push((bin, source));
+    for item in &aux {
+        println!("🧪 Using {} {}", item.label, file_name(&item.source).bold().cyan());
+        bins.push(item.bin);
+        generated.push((item.bin, item.source.as_path()));
     }
     let outcome = {
         // The installed sources are removed when this block ends, whatever the outcome.
@@ -368,30 +412,61 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     };
     if let BuildOutcome::Failed { log } = outcome {
         eprintln!("{}", "❌ Compilation failed!".red().bold());
-        if verifier.bin().is_some() {
-            eprintln!("(the solution and the {} are built together; the log shows which one failed)", verifier.label());
+        if !aux.is_empty() {
+            let labels: Vec<&str> = aux.iter().map(|item| item.label).collect();
+            eprintln!("(the solution and the {} are built together; the log shows which one failed)", labels.join(", "));
         }
         println!("{}", log);
         return Ok(ExitCode::from(1));
     }
 
     let release_dir = project_root.join("target/release");
-    let workdir = project_root.join("target/judge");
-    let mode = match &verifier {
-        Verifier::Builtin => Mode::Batch { checker: None },
-        Verifier::Checker(_) => Mode::Batch { checker: Some(release_dir.join(compile::CHECKER_BIN)) },
-        Verifier::Interactor(_) => Mode::Interactive { interactor: release_dir.join(compile::INTERACTOR_BIN) },
-    };
-    if verifier.bin().is_some() {
-        let _ = fs::remove_dir_all(&workdir);
-        fs::create_dir_all(&workdir)?;
-    }
-
     let default_timeout = Duration::from_secs(3);
     let limits = Limits {
         time: config.time_limit.map(Duration::from_millis).unwrap_or(default_timeout),
         memory_bytes: config.memory_limit.unwrap_or(256) * 1024 * 1024, // MB to Bytes
     };
+
+    if cli.stress {
+        let oracle = match (&files.verifier, &files.brute) {
+            (Verifier::Interactor(_), _) => stress::Oracle::Interactor { interactor: release_dir.join(compile::INTERACTOR_BIN) },
+            (Verifier::Checker(_), Some(_)) => stress::Oracle::Brute {
+                brute: release_dir.join(compile::BRUTE_BIN),
+                checker: Some(release_dir.join(compile::CHECKER_BIN)),
+            },
+            (_, Some(_)) => stress::Oracle::Brute { brute: release_dir.join(compile::BRUTE_BIN), checker: None },
+            (_, None) => unreachable!("choose_files requires a brute force for a stress test of an ordinary problem"),
+        };
+        let setup = stress::Setup {
+            project_root: project_root.to_path_buf(),
+            solution: release_dir.join(&package.name),
+            generator: release_dir.join(compile::GENERATOR_BIN),
+            oracle,
+            limits,
+            plan: stress::Plan {
+                iters: cli.iters.or(hints.iters).unwrap_or(stress::DEFAULT_ITERS),
+                base_seed: cli.seed.unwrap_or_else(fresh_seed),
+                max_size: cli.max_size.or(hints.max_size).unwrap_or(stress::DEFAULT_MAX_SIZE),
+                shrink_seeds: hints.shrink_seeds.unwrap_or(stress::DEFAULT_SHRINK_SEEDS),
+            },
+            prob_path: prob_path.clone(),
+            save: cli.save,
+        };
+        return Ok(stress::run(setup).await?);
+    }
+
+    let verifier = &files.verifier;
+    let workdir = project_root.join("target/judge");
+    let mode = match verifier {
+        Verifier::Builtin => Mode::Batch { checker: None },
+        Verifier::Checker(_) => Mode::Batch { checker: Some(release_dir.join(compile::CHECKER_BIN)) },
+        Verifier::Interactor(_) => Mode::Interactive { interactor: release_dir.join(compile::INTERACTOR_BIN) },
+    };
+    if !aux.is_empty() {
+        let _ = fs::remove_dir_all(&workdir);
+        fs::create_dir_all(&workdir)?;
+    }
+
     let judge = Arc::new(Judge {
         bin_path: release_dir.join(&package.name),
         project_root: project_root.to_path_buf(),
@@ -436,7 +511,7 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     if passed_count < total_tests {
-        match &verifier {
+        match verifier {
             Verifier::Builtin => {}
             Verifier::Checker(_) => println!(
                 "\nℹ️  Checker files for test N are in {}: N.in, N.out (program output), N.ans (stored answer)",

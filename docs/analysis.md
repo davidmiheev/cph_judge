@@ -13,7 +13,10 @@ A competitive programming judge tool written in Rust that discovers `.prob` prob
 | `src/compile.rs` | Reads the package name and `autobins`, finds auxiliary files, installs them into `src/bin/` for the build, runs `cargo build --release --bin ...` |
 | `src/checker.rs` | Runs a custom `_checker` and maps testlib exit codes to a verdict (shared with interactors) |
 | `src/interactive.rs` | Runs the solution against an `_interactor` over two pipes and decides who failed first |
-| `tests/` | End-to-end tests (`checker.rs`, `interactive.rs`, `paths.rs`): build throwaway Cargo projects and run the real judge |
+| `src/stress.rs` | Stress testing: generator, brute force or interactor as oracle, parallel batches, shrinking, `--save` |
+| `src/cli.rs`, `src/hints.rs` | Command-line parsing; per-problem hints from the `.prob` or a sidecar file |
+| `src/report.rs` | Terminal output shared by normal and stress mode |
+| `tests/` | End-to-end tests (`checker.rs`, `interactive.rs`, `stress.rs`, `paths.rs`): build throwaway Cargo projects and run the real judge |
 | `src/runner.rs` | Runs one process under limits (`run_once`) and turns the report into a verdict (`RunReport::check`) |
 | `src/compare.rs` | Tokenized, float-aware output comparison |
 | `docs/arch.md` | System architecture, pipeline, and verdict documentation |
@@ -42,3 +45,4 @@ A competitive programming judge tool written in Rust that discovers `.prob` prob
 5. **Exit codes**: `0` all passed, `1` compile failure or failed tests, `2` usage / judge error.
 6. **Custom checkers**: a `<solution>_checker.rs` next to the solution is built together with it and decides AC/WA, so problems with several valid answers are judged correctly instead of being compared to the one stored answer. The build now names its targets (`--bin`) instead of building everything in the project.
 7. **Interactive problems**: with `"interactive": true` the solution runs against `<solution>_interactor.rs` joined by two pipes. When both sides fail the first failure wins, a solution that leaves early gets the blame for the interactor's broken pipe, and a solution still running after the interactor rejected it is killed immediately. Relative search directories were fixed along the way: the project root has to be absolute because child processes run inside it.
+8. **Stress testing**: `--stress` generates tests with `<solution>_gen.rs`, judges them with a brute force (and the checker, if any) or the interactor, runs in parallel chunks but reports the lowest failing test so runs are repeatable, and shrinks a counterexample by searching smaller sizes for a failure of the same kind. Problems with the generator, brute force, checker or interactor are reported as such rather than as counterexamples. Unit tests caught two mistakes along the way: shrink seeds that collided in pairs, and (in the interactive work) a misattributed broken pipe.

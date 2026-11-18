@@ -52,7 +52,9 @@ flowchart TD
   `GeneratedBins` to `src/bin/__judge_checker.rs` or `src/bin/__judge_interactor.rs` for the duration
   of the build and removed afterwards. With `autobins = false` this cannot work, so the judge exits
   with code 2 and an explanation.
-- Executes `cargo build --release --bin <package> [--bin __judge_checker | --bin __judge_interactor]` (`build_release`),
+- With `--stress` the generator and, for an ordinary problem, the brute force are built too
+  (`__judge_gen`, `__judge_brute`).
+- Executes `cargo build --release --bin <package> [--bin __judge_checker | --bin __judge_interactor] [--bin __judge_brute --bin __judge_gen]` (`build_release`),
   redirecting stderr to `compiler_log.txt`. Building via cargo keeps the project's edition, profile and
   dependencies for every binary.
 - Halts execution and prints logs if compilation fails (a checker that does not compile fails the build).
@@ -124,15 +126,38 @@ With `"interactive": true` each test runs the solution against `<solution>_inter
   `Broken pipe`, the verdict is a wrong answer ("the solution stopped reading ...").
 - The interactor's verdict replaces the output comparison; a checker, if present, is ignored.
 
-### 8. Exit Codes
+### 8. Stress Testing (`stress.rs`)
+
+`--stress` replaces running the `.prob` tests with a search for a counterexample. After the build
+(which now also builds `<solution>_gen.rs` and, for an ordinary problem, `<solution>_brute.rs`):
+
+1. Each iteration runs `gen <seed> <size>`, then the oracle: the brute force plus the built-in comparison
+   or the checker, or, for an interactive problem, the interactor. Sizes ramp from 1 to `maxSize`.
+2. `first_failure` runs iterations in parallel chunks and returns the lowest failing index.
+3. `find_smaller` shrinks a fault by trying smaller sizes with many seeds for a failure of the same kind.
+4. The counterexample is printed and kept in `target/judge/stress/`; `--save` appends it to the `.prob`.
+
+A failure is either a `Fault` of the solution (wrong answer, PE, TLE, MLE, RE) or a `Problem` with the
+judge's own setup (generator, brute force, checker, interactor); only faults are counterexamples.
+`first_failure` and `find_smaller` are generic over the trial function, so their ordering and shrinking
+rules are unit-tested with fake evaluators.
+
+### 9. Command Line and Hints (`cli.rs`, `hints.rs`)
+
+`judge <search_dir> <problem_name> [--stress [--iters N] [--seed S] [--max-size N] [--save]]`.
+Hints come from an optional `"stress"` object in the `.prob` and from a sidecar `<solution>.stress.json`
+(which wins). They name the auxiliary files (resolved against the solution's directory, overriding the
+`_suffix` convention) and tune the stress run; command-line options win over hints.
+
+### 10. Exit Codes
 
 | Code | Meaning |
 |---|---|
-| 0 | Every test passed |
-| 1 | Compilation failed, or at least one test did not pass |
-| 2 | Usage error, or the judge itself could not run (e.g. `.prob` not found) |
+| 0 | Every test passed (stress: no counterexample found) |
+| 1 | Compilation failed, at least one test did not pass, or (stress) a counterexample was found |
+| 2 | Usage error, or the judge itself could not run (e.g. `.prob` not found; stress: a problem with the generator, brute force, checker or interactor) |
 
-### 9. Source Layout
+### 11. Source Layout
 
 | File | Contents |
 |---|---|
@@ -140,13 +165,17 @@ With `"interactive": true` each test runs the solution against `<solution>_inter
 | `src/compile.rs` | `package_info`, `aux_source`, `GeneratedBins`, `build_release` |
 | `src/checker.rs` | `run_checker`, `interpret`, `exit_verdict` (testlib exit code → `Verdict`, shared with interactors) |
 | `src/interactive.rs` | `run_interaction`, `decide`, `interact` |
+| `src/stress.rs` | `evaluate`, `first_failure`, `find_smaller`, `run`, `save_counterexample` |
+| `src/cli.rs` | `parse`, `USAGE` |
+| `src/hints.rs` | `Hints`, `load` (the `.prob` object and the sidecar file) |
+| `src/report.rs` | Printing shared by normal and stress mode |
 | `src/runner.rs` | `run_once`, `RunReport::check`, `violation`, `Limits`, `RunError`, `format_exit_status` |
 | `src/compare.rs` | `compare_outputs` |
 
-Tests: unit tests live next to the code. `tests/checker.rs`, `tests/interactive.rs` and `tests/paths.rs`
-build throwaway Cargo projects (helpers in `tests/common/`) and run the real binary.
+Tests: unit tests live next to the code. `tests/checker.rs`, `tests/interactive.rs`, `tests/stress.rs` and
+`tests/paths.rs` build throwaway Cargo projects (helpers in `tests/common/`) and run the real binary.
 
-Planned stress features: see [`design-stress-interactive.md`](design-stress-interactive.md).
+Planned generator inference: see [`design-stress-interactive.md`](design-stress-interactive.md).
 
 ---
 

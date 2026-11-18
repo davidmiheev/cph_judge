@@ -1,6 +1,6 @@
 # Design: checker, interactive problems, and stress testing
 
-Status: **phases 0-2 done** (runner, CPU-time limits, `_checker`, interactive problems); the rest is planned. See [Phases](#phases).
+Status: **phases 0-3 done** (runner, CPU-time limits, `_checker`, interactive problems, stress testing with a hand-written generator); the inferred generator (phases 4-5) is planned. See [Phases](#phases).
 
 All three features are the same machine with different inputs and a different
 oracle (the thing that decides pass/fail):
@@ -23,8 +23,7 @@ sort beside it. For `A.rs`:
 | `A_checker.rs`   | answer checker (normal and stress)          |
 | `A_interactor.rs`| interactor (interactive)                    |
 
-Each is meant to be overridable by path in the hints (see [Hints](#hints)); until the hints exist (phase 3) only
-the suffix convention is implemented.
+Each can be overridden by path in the hints (see [Hints](#hints)).
 
 ## Building the auxiliary binaries
 
@@ -84,7 +83,7 @@ Implemented in phase 1 (normal mode):
 - Checker failures are shown as `checker failed (...)` and count as not passed (exit code 1), but are
   never labelled WA.
 
-Not yet implemented: the stress sanity check above, and path overrides.
+The stress sanity check is implemented in phase 3 (see below), and so are path overrides.
 
 Limitation: checkers are Rust for now (C++ testlib checkers wait for multi-language support).
 
@@ -139,12 +138,12 @@ Implemented in phase 2 (`src/interactive.rs`):
 - Memory is checked on the solution only, with the same `violation` classification as normal runs.
 
 Not implemented: a transcript of the conversation on failure (the judge never sees the data, since it
-flows between the processes directly), and driving the interactive run from the generator (phase 3).
+flows between the processes directly). Driving an interactive run from the generator is done in phase 3.
 
 ## Stress (`--stress`)
 
-`cph_judge <dir> <name> --stress [--iters N] [--seed S] [--save]`; the existing positional form is
-unchanged.
+`cph_judge <dir> <name> --stress [--iters N] [--seed S] [--max-size N] [--save]`; the existing
+positional form is unchanged.
 
 1. Generate `(seed, size)`, with `size` ramping up over the iterations.
 2. Run brute force, then the solution.
@@ -160,6 +159,43 @@ format guess does not look like a bug in the solution.
 few hundred seeds each and report the smallest failing case. `--save` appends it to the `.prob`
 tests as a regression test. Schema-aware shrinking (reduce lengths, then values, keeping the input
 valid) is a later step.
+
+Implemented in phase 3 (`src/stress.rs`, `src/cli.rs`, `src/hints.rs`):
+
+- **Defaults.** 1000 tests, sizes `1..=20` (`iters` / `maxSize` hints, `--iters` / `--max-size`; the
+  command line wins). The size of test `i` is `1 + i * max_size / iters`, so every size gets an equal
+  share of the run and small sizes come first. Test `i` uses seed `base_seed + i`. Without `--seed`
+  the base seed is fresh and printed ("repeat the run with --seed N"); with it a run is repeatable
+  down to the report, which the end-to-end tests rely on.
+- **The generator** is run as `gen <seed> <size>` and must print one test to stdout (10 s CPU, 1 GiB).
+  Printing only whitespace counts as a failure.
+- **The brute force** gets `max(10 × the solution's time limit, 10 s)` and at least 1 GiB.
+- **Batches.** Tests run in chunks of 4 × cores, each chunk in parallel with at most one evaluation
+  per core; the lowest failing index of the first chunk with a failure is reported. Progress is
+  printed every 250 tests.
+- **Shrinking** tries sizes `1..found_size` in turn, `shrinkSeeds` (default 200) seeds each, and
+  accepts only a failure of the **same kind** (wrong answer, PE, TLE, MLE, RE), so it does not swap
+  the bug for a different one. A judge-side problem at a smaller size is not a shrink. Seeds for
+  shrinking are derived from the base seed so shrinking is repeatable too (an early version mapped
+  seeds `k` and `k^1` to the same value, which a unit test caught).
+- **Oracles.** Ordinary problem: the brute force's output is compared with the built-in comparison,
+  or, if there is a checker, handed to it as the jury answer after `checker(input, brute, brute)` has
+  been run to make sure the checker accepts it. Interactive problem: the interactor decides, no brute
+  force is involved (and a `brute` file is ignored).
+- **Setup problems are not counterexamples** and exit with code 2: the generator crashing, timing out
+  or printing nothing; the brute force failing on a generated input (shown, with a hint that the input
+  may be invalid or the size too big for it); the checker rejecting the brute force's own answer; the
+  checker or interactor failing. A solution that cannot be started is reported but not shrunk.
+- **Exit codes:** 0 no counterexample, 1 a counterexample, 2 a setup problem or usage error.
+- **Output.** The counterexample is shown with the input (long ones are cut to 40 lines / 2000
+  characters), what the brute force and the solution printed or the checker / interactor said, and the
+  command that regenerates the input. The full files are kept in
+  `<project>/target/judge/stress/counterexample.in` (and `.out` / `.ans`).
+- **`--save`** appends `{id, input, output}` to the `.prob`'s `tests`, where `output` is the brute
+  force's answer (empty for interactive problems) and `id` is one above the highest existing id (or a
+  timestamp). Everything else in the file is kept, but it is rewritten as compact JSON with the keys in
+  alphabetical order, replacing the file atomically. That `id` is a number is an assumption about the
+  CPH editor, not checked here.
 
 ## Generator
 
@@ -194,14 +230,24 @@ bugs), and mix in boundary values from the hints.
 
 ### Hints
 
-An optional `"stress"` object in the `.prob` (serde already ignores unknown fields):
+An optional `"stress"` object in the `.prob`, or the same object in a sidecar `A.stress.json` next to
+the solution (the sidecar wins field by field). Unknown fields are ignored. Implemented in phase 3:
 
 ```json
-"stress": { "multitest": true, "vars": { "t": "1..5", "n": "1..8", "a": "1..n" } }
+"stress": {
+  "brute": "tools/slow.rs", "gen": "tools/make.rs", "checker": "my_checker.rs", "interactor": "talk.rs",
+  "iters": 500, "maxSize": 12, "shrinkSeeds": 100
+}
 ```
 
-Assumption to verify: that the CPH editor extension preserves unknown keys when it rewrites the
-file. If it strips them, fall back to a sidecar `A.stress.json`.
+- File hints are paths, relative to the solution's directory, and win over the `_suffix` convention.
+  A hint naming a file that does not exist is an error, not a fallback.
+- `checker` and `interactor` also apply to ordinary judging; the rest are only read with `--stress`.
+- Planned for the inferred generator (phase 4): `vars`, `multitest` and friends, e.g.
+  `{ "multitest": true, "vars": { "t": "1..5", "n": "1..8", "a": "1..n" } }`.
+
+Whether the CPH editor keeps unknown keys when it rewrites the `.prob` is not verified; the sidecar
+exists so the hints survive if it does not.
 
 ## Phases
 
@@ -210,6 +256,6 @@ file. If it strips them, fall back to a sidecar `A.stress.json`.
 | 0 | Extract `compile` / `run_once` / `check`; fix stdin deadlock; CPU-time limits (killed live at the limit on Linux); bounded concurrency; exit codes | **done** |
 | 1 | `_checker` in normal mode (introduces the extra-binary build, temp files, exit-code mapping) | **done** |
 | 2 | Interactive mode, reusing phase 1 machinery | **done** |
-| 3 | Stress with `_gen` / `_brute`, ramping, size-based shrinking, `--save` | planned |
+| 3 | Stress with `_gen` / `_brute`, ramping, size-based shrinking, `--save`, hints and sidecar | **done** |
 | 4 | Schema inference and built-in generator, `--show-schema` | planned |
 | 5 | Schema-aware shrinking | planned |

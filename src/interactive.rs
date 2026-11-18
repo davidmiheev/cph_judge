@@ -40,9 +40,7 @@ use std::{
 use wait4::Wait4;
 
 use crate::checker::{self, Verdict as ExitVerdict};
-use crate::runner::{
-    Limits, POLL_INTERVAL, RunError, format_exit_status, kill_process_tree, process_cpu_time, violation,
-};
+use crate::runner::{Limits, POLL_INTERVAL, RunError, kill_process_tree, process_cpu_time, violation};
 
 /// How long the interactor may keep running after the solution has failed. It normally
 /// notices the closed pipes and exits at once, and what it says is shown as a note.
@@ -179,7 +177,7 @@ pub fn decide(report: &InteractionReport, limits: &Limits) -> Verdict {
                 }
             } else {
                 Verdict {
-                    note: Some(format!("afterwards the solution failed too: {}", describe_failure(&failure))),
+                    note: Some(format!("afterwards the solution failed too: {}", failure.describe())),
                     outcome: interactor_outcome(rejected),
                 }
             }
@@ -217,15 +215,6 @@ fn describe_rejection(verdict: &ExitVerdict) -> String {
         ExitVerdict::Failed(message) => return message.clone(),
     };
     if message.is_empty() { what.to_string() } else { format!("{what}: {message}") }
-}
-
-fn describe_failure(failure: &RunError) -> String {
-    match failure {
-        RunError::Tle => "time limit exceeded".to_string(),
-        RunError::Mle => "memory limit exceeded".to_string(),
-        RunError::Re { status, .. } => format!("runtime error ({})", format_exit_status(*status)),
-        RunError::System(e) => e.clone(),
-    }
 }
 
 fn command(program: &Program, cwd: &Path) -> Command {
