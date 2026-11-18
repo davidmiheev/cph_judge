@@ -1,6 +1,6 @@
 # Design: checker, interactive problems, and stress testing
 
-Status: **phases 0 and 1 done** (runner, CPU-time limits, `_checker`); the rest is planned. See [Phases](#phases).
+Status: **phases 0-2 done** (runner, CPU-time limits, `_checker`, interactive problems); the rest is planned. See [Phases](#phases).
 
 All three features are the same machine with different inputs and a different
 oracle (the thing that decides pass/fail):
@@ -90,9 +90,10 @@ Limitation: checkers are Rust for now (C++ testlib checkers wait for multi-langu
 
 ## Interactive (`A_interactor.rs`)
 
-Judges do not publish interactors and `.prob` samples for interactive problems are typically a
-transcript, not a runnable test, so the user supplies the interactor, and test data comes from
-`.prob` entries (treated as hidden-input files) or the generator.
+Judges do not publish interactors, and the samples in a `.prob` for an interactive problem may show the
+conversation instead of data an interactor can read (not verified against Competitive Companion), so
+the user supplies the interactor, and test data comes from `.prob` entries (treated as hidden-input
+files) or the generator.
 
 - Invocation: `interactor <input_file>`. Interactor stdin = solution stdout; interactor stdout =
   solution stdin; diagnostics on stderr.
@@ -107,6 +108,38 @@ transcript, not a runnable test, so the user supplies the interactor, and test d
   report that; otherwise report the interactor's verdict.
 - Time limit: the solution's CPU time (the interactor's thinking time must not count), plus a
   wall-clock cap to catch two processes waiting on each other.
+
+Implemented in phase 2 (`src/interactive.rs`):
+
+- **Mode selection.** Interactive mode is switched on by `"interactive": true` in the `.prob`, which
+  Competitive Companion sets. The interactor is then required: without `A_interactor.rs` the judge
+  exits with code 2 and names the file it expected. An interactor next to a problem that is not marked
+  interactive, or a checker next to an interactive one, is ignored with a printed note.
+- **Test data.** Each test's `input` is written to `<project>/target/judge/N.in` and passed as the
+  interactor's only argument; the stored `output` is unused. The files are kept for debugging.
+- **Pipes.** The judge's own pipe ends are closed right after both processes start. Mutation-checked:
+  keeping them (by holding on to the `Command`s) makes EOF never arrive, and four tests hang until the
+  wall-clock cap.
+- **Killing.** The solution is killed at its CPU limit, both processes at the wall-clock cap. A solution
+  still running after the interactor has rejected it is killed at once instead of being left to run to
+  its time limit. An interactor still running 250 ms after the solution failed is killed too, which
+  keeps a stuck interactor from turning a runtime error into a timeout.
+- **First failure wins**, by the order in which the two processes were reaped; the other side's failure
+  is shown as a note (`afterwards the interactor reported: ...`, `afterwards the solution failed too: ...`)
+  so a misjudged order is visible. A process the judge itself killed is never counted as having failed.
+  The order comes from two threads each waiting on one process, so exits closer together than a
+  scheduler wake-up could in principle be misordered.
+- **Broken pipes blame the solution.** A solution that exits before the conversation is over leaves the
+  interactor writing to a pipe nobody reads. A C or C++ interactor is then killed by SIGPIPE; a Rust one
+  panics with `Broken pipe`. If the solution left first, either is reported as a wrong answer ("the
+  solution stopped reading ..."), not as an interactor failure. Found by a test that failed in about 7%
+  of runs. Any other interactor failure after the solution has gone gets a note instead.
+- **Interactor verdicts** use the testlib mapping shared with checkers (`checker::exit_verdict`): 1 is WA,
+  2 is PE, and exit 3, any other code or a crash is `interactor failed`, never a WA.
+- Memory is checked on the solution only, with the same `violation` classification as normal runs.
+
+Not implemented: a transcript of the conversation on failure (the judge never sees the data, since it
+flows between the processes directly), and driving the interactive run from the generator (phase 3).
 
 ## Stress (`--stress`)
 
@@ -176,7 +209,7 @@ file. If it strips them, fall back to a sidecar `A.stress.json`.
 |---|-------|--------|
 | 0 | Extract `compile` / `run_once` / `check`; fix stdin deadlock; CPU-time limits (killed live at the limit on Linux); bounded concurrency; exit codes | **done** |
 | 1 | `_checker` in normal mode (introduces the extra-binary build, temp files, exit-code mapping) | **done** |
-| 2 | Interactive mode, reusing phase 1 machinery | planned |
+| 2 | Interactive mode, reusing phase 1 machinery | **done** |
 | 3 | Stress with `_gen` / `_brute`, ramping, size-based shrinking, `--save` | planned |
 | 4 | Schema inference and built-in generator, `--show-schema` | planned |
 | 5 | Schema-aware shrinking | planned |

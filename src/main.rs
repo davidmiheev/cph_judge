@@ -1,6 +1,7 @@
 mod checker;
 mod compare;
 mod compile;
+mod interactive;
 mod runner;
 
 use colored::*;
@@ -8,7 +9,6 @@ use ignore::WalkBuilder;
 use serde::Deserialize;
 use std::{
     env, fs,
-    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -19,7 +19,8 @@ use tokio::sync::Semaphore;
 use checker::run_checker;
 use compare::compare_outputs;
 use compile::BuildOutcome;
-use runner::{Limits, RunError, RunOutput, run_once};
+use interactive::{Outcome, Program};
+use runner::{Limits, RunError, RunOutput, format_exit_status, run_once};
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -41,46 +42,67 @@ struct Test {
     output: String,
 }
 
+/// What decides whether a run is right, chosen from the files next to the solution.
+enum Verifier {
+    /// Compare the output with the stored expected output.
+    Builtin,
+    /// `<solution>_checker.rs`: validates the output of a normal run.
+    Checker(PathBuf),
+    /// `<solution>_interactor.rs`: talks to the solution and gives the verdict.
+    Interactor(PathBuf),
+}
+
+impl Verifier {
+    /// The source file and Cargo binary name to build, if there is anything to build.
+    fn bin(&self) -> Option<(&'static str, &Path)> {
+        match self {
+            Verifier::Builtin => None,
+            Verifier::Checker(src) => Some((compile::CHECKER_BIN, src)),
+            Verifier::Interactor(src) => Some((compile::INTERACTOR_BIN, src)),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Verifier::Builtin => "checker",
+            Verifier::Checker(_) => "checker",
+            Verifier::Interactor(_) => "interactor",
+        }
+    }
+}
+
+/// How each test is run, with the compiled verifier where there is one.
+enum Mode {
+    Batch { checker: Option<PathBuf> },
+    Interactive { interactor: PathBuf },
+}
+
 /// Everything needed to judge one test, shared by all test tasks.
 struct Judge {
     bin_path: PathBuf,
     project_root: PathBuf,
     limits: Limits,
-    /// Compiled checker, when the solution has a `_checker` file.
-    checker: Option<PathBuf>,
-    /// Where the checker's input / output / answer files for each test are written.
+    mode: Mode,
+    /// Where the files handed to the checker or interactor are written, per test.
     workdir: PathBuf,
 }
 
 /// What the program's output was judged to be, for a run that stayed within its limits.
 enum Judgement {
     Accepted,
-    /// Wrong answer. Carries the checker's message when a checker made the call.
+    /// Wrong answer. Carries the checker's or interactor's message when it made the call.
     Wrong(Option<String>),
     Presentation(String),
-    /// The checker itself failed, which says nothing about the solution.
-    CheckerFailed(String),
+    /// The checker or interactor itself failed, which says nothing about the solution.
+    VerifierFailed(String),
 }
 
 struct TestOutcome {
     run: Result<RunOutput, RunError>,
     /// `None` when the run did not complete within its limits.
     judgement: Option<Judgement>,
-}
-
-fn format_exit_status(status: std::process::ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        format!("exit code {}", code)
-    } else if let Some(sig) = status.signal() {
-        match sig {
-            6 => "SIGABRT (abort / panic)".to_string(),
-            8 => "SIGFPE (div by zero / arithmetic error)".to_string(),
-            11 => "SIGSEGV (segmentation fault / memory error)".to_string(),
-            sig => format!("signal {}", sig),
-        }
-    } else {
-        "terminated unexpectedly".to_string()
-    }
+    /// Extra context, such as what the other side did when both failed.
+    note: Option<String>,
 }
 
 fn find_prob_file(search_root: &str, target: &str) -> Option<PathBuf> {
@@ -96,21 +118,28 @@ fn find_prob_file(search_root: &str, target: &str) -> Option<PathBuf> {
         .map(|e| e.into_path())
 }
 
-/// Runs the solution on one test and judges its output.
 async fn judge_test(judge: &Judge, index: usize, test: &Test) -> TestOutcome {
+    match &judge.mode {
+        Mode::Batch { checker } => judge_batch(judge, checker.as_deref(), index, test).await,
+        Mode::Interactive { interactor } => judge_interactive(judge, interactor, index, test).await,
+    }
+}
+
+/// Runs the solution on one test's input and judges its output.
+async fn judge_batch(judge: &Judge, checker: Option<&Path>, index: usize, test: &Test) -> TestOutcome {
     let run = match run_once(&judge.bin_path, [] as [&str; 0], &judge.project_root, test.input.as_bytes(), &judge.limits).await {
         Ok(report) => report.check(&judge.limits),
         Err(e) => Err(e),
     };
     let judgement = match &run {
-        Ok(output) => Some(judge_output(judge, index, test, output).await),
+        Ok(output) => Some(judge_output(judge, checker, index, test, output).await),
         Err(_) => None,
     };
-    TestOutcome { run, judgement }
+    TestOutcome { run, judgement, note: None }
 }
 
-async fn judge_output(judge: &Judge, index: usize, test: &Test, output: &RunOutput) -> Judgement {
-    let Some(checker_bin) = &judge.checker else {
+async fn judge_output(judge: &Judge, checker: Option<&Path>, index: usize, test: &Test, output: &RunOutput) -> Judgement {
+    let Some(checker_bin) = checker else {
         return if compare_outputs(output.stdout.trim(), test.output.trim()) {
             Judgement::Accepted
         } else {
@@ -131,20 +160,52 @@ async fn judge_output(judge: &Judge, index: usize, test: &Test, output: &RunOutp
     }
     .await;
     if let Err(e) = written {
-        return Judgement::CheckerFailed(format!("could not write files for the checker: {e}"));
+        return Judgement::VerifierFailed(format!("could not write files for the checker: {e}"));
     }
 
     match run_checker(checker_bin, &judge.project_root, &input_file, &output_file, &answer_file).await {
         checker::Verdict::Ok => Judgement::Accepted,
         checker::Verdict::Wrong(message) => Judgement::Wrong(Some(message)),
         checker::Verdict::Presentation(message) => Judgement::Presentation(message),
-        checker::Verdict::Failed(message) => Judgement::CheckerFailed(message),
+        checker::Verdict::Failed(message) => Judgement::VerifierFailed(message),
     }
 }
 
+/// Runs the solution against the interactor, which gets the test's input as a file.
+async fn judge_interactive(judge: &Judge, interactor: &Path, index: usize, test: &Test) -> TestOutcome {
+    let input_file = judge.workdir.join(format!("{}.in", index + 1));
+    if let Err(e) = tokio::fs::write(&input_file, &test.input).await {
+        return TestOutcome {
+            run: Ok(no_output(Duration::ZERO, 0)),
+            judgement: Some(Judgement::VerifierFailed(format!("could not write the interactor's input file: {e}"))),
+            note: None,
+        };
+    }
+
+    let solution = Program::new(&judge.bin_path);
+    let interactor = Program::new(interactor).with_args([&input_file]);
+    let verdict = interactive::interact(&solution, &interactor, &judge.project_root, &judge.limits).await;
+
+    let (run, judgement) = match verdict.outcome {
+        Outcome::Accepted { cpu_time, max_rss } => (Ok(no_output(cpu_time, max_rss)), Some(Judgement::Accepted)),
+        Outcome::Wrong(message) => (Ok(no_output(Duration::ZERO, 0)), Some(Judgement::Wrong(Some(message)))),
+        Outcome::Presentation(message) => (Ok(no_output(Duration::ZERO, 0)), Some(Judgement::Presentation(message))),
+        Outcome::InteractorFailed(message) => (Ok(no_output(Duration::ZERO, 0)), Some(Judgement::VerifierFailed(message))),
+        Outcome::SolutionFailed(error) => (Err(error), None),
+    };
+    TestOutcome { run, judgement, note: verdict.note }
+}
+
+/// A completed run whose output the judge never sees (the interactor consumed it).
+fn no_output(cpu_time: Duration, max_rss: u64) -> RunOutput {
+    RunOutput { stdout: String::new(), cpu_time, max_rss }
+}
+
 /// Prints the result of one test; returns whether it was accepted.
-fn print_outcome(test_label: &str, test: &Test, limits: &Limits, outcome: TestOutcome) -> bool {
-    match (outcome.run, outcome.judgement) {
+fn print_outcome(test_label: &str, test: &Test, limits: &Limits, verifier: &str, outcome: TestOutcome) -> bool {
+    let TestOutcome { run, judgement, note } = outcome;
+    let mut accepted = false;
+    match (run, judgement) {
         (Err(RunError::Tle), _) => {
             let limit_label = format!("{:.2}s", limits.time.as_secs_f32());
             println!("{}  {} ({})", "⏱️".yellow(), format!("{} TLE", test_label).yellow(), limit_label);
@@ -169,7 +230,7 @@ fn print_outcome(test_label: &str, test: &Test, limits: &Limits, outcome: TestOu
         (Ok(output), Some(Judgement::Accepted)) => {
             let mem_mb = output.max_rss as f64 / 1048576.0;
             println!("{} {} ({:.2?}, {:.2} MB)", "✅".green(), test_label.green(), output.cpu_time, mem_mb);
-            return true;
+            accepted = true;
         }
         (Ok(output), Some(Judgement::Wrong(None))) => {
             println!("{} {}", "❌".red(), test_label.red().bold());
@@ -181,28 +242,35 @@ fn print_outcome(test_label: &str, test: &Test, limits: &Limits, outcome: TestOu
         }
         (Ok(_), Some(Judgement::Wrong(Some(message)))) => {
             println!("{} {}", "❌".red(), test_label.red().bold());
-            print_checker_message(&message);
+            print_verifier_message(verifier, &message);
         }
         (Ok(_), Some(Judgement::Presentation(message))) => {
             println!("{} {}", "❌".red(), format!("{} PE", test_label).red().bold());
-            print_checker_message(&message);
+            print_verifier_message(verifier, &message);
         }
-        (Ok(_), Some(Judgement::CheckerFailed(message))) => {
-            println!("{}  {} ({})", "⚠️".red(), format!("{} checker failed", test_label).red(), message);
+        (Ok(_), Some(Judgement::VerifierFailed(message))) => {
+            println!("{}  {} ({})", "⚠️".red(), format!("{} {} failed", test_label, verifier).red(), message);
         }
         (Ok(_), None) => unreachable!("a completed run is always judged"),
     }
-    false
+    if let Some(note) = note {
+        println!("   {}", note.dimmed());
+    }
+    accepted
 }
 
-fn print_checker_message(message: &str) {
-    println!("{}", "--- Checker ---".blue());
+fn print_verifier_message(verifier: &str, message: &str) {
+    let mut title = verifier.to_string();
+    if let Some(first) = title.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    println!("{}", format!("--- {title} ---").blue());
     if message.is_empty() {
         println!("(no message)");
     } else {
         println!("{}", message);
     }
-    println!("{}", "---------------".blue());
+    println!("{}", "-".repeat(title.len() + 8).blue());
 }
 
 /// Exit codes: 0 = every test passed, 1 = compilation failed or a test failed,
@@ -218,6 +286,40 @@ async fn main() -> ExitCode {
     }
 }
 
+fn file_name(path: &Path) -> String {
+    path.file_name().unwrap_or_default().to_string_lossy().into_owned()
+}
+
+/// Picks the verifier from the files next to the solution and the problem's `interactive` flag.
+fn choose_verifier(src_path: &Path, interactive: bool) -> Result<Verifier, String> {
+    let checker = compile::aux_source(src_path, "checker");
+    let interactor = compile::aux_source(src_path, "interactor");
+
+    if interactive {
+        let Some(interactor) = interactor else {
+            return Err(format!(
+                "the problem is marked interactive but no interactor was found; expected {}",
+                compile::aux_path(src_path, "interactor").display()
+            ));
+        };
+        if let Some(checker) = checker {
+            println!("ℹ️  Ignoring checker {}: the interactor decides the verdict of an interactive problem", file_name(&checker));
+        }
+        return Ok(Verifier::Interactor(interactor));
+    }
+
+    if let Some(interactor) = interactor {
+        println!(
+            "ℹ️  Ignoring interactor {}: the problem is not marked interactive (`\"interactive\": true` in the .prob file)",
+            file_name(&interactor)
+        );
+    }
+    Ok(match checker {
+        Some(checker) => Verifier::Checker(checker),
+        None => Verifier::Builtin,
+    })
+}
+
 async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
@@ -226,20 +328,25 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     let prob_path = find_prob_file(&args[1], &args[2]).ok_or("Metadata file not found.")?;
+    // Everything derived from this path (the project root, the binaries inside it) is used
+    // as the program path of child processes started in the project root. A relative path
+    // would then be resolved against the wrong directory.
+    let prob_path = std::path::absolute(&prob_path)?;
 
     let config: CphConfig = serde_json::from_str(&fs::read_to_string(&prob_path)?)?;
     let project_root = prob_path.parent().and_then(|p| p.parent()).ok_or("Root not found")?;
 
     let package = compile::package_info(project_root)?;
     let src_path = Path::new(&config.src_path);
-    let checker_src = compile::aux_source(src_path, "checker");
-    if let Some(checker_src) = &checker_src
+    let verifier = choose_verifier(src_path, config.interactive)?;
+    if let Some((_, source)) = verifier.bin()
         && !package.autobins
     {
         return Err(format!(
             "found {} but Cargo.toml sets `autobins = false`, so the judge cannot build it from src/bin/; \
-             remove that setting or the checker",
-            checker_src.display()
+             remove that setting or the {}",
+            source.display(),
+            verifier.label()
         )
         .into());
     }
@@ -249,11 +356,10 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     println!("🔨 Compiling {} ({})", package.name.bold(), "release".yellow());
     let mut bins = vec![package.name.as_str()];
     let mut generated: Vec<(&str, &Path)> = Vec::new();
-    if let Some(checker_src) = &checker_src {
-        let file_name = checker_src.file_name().unwrap_or_default().to_string_lossy();
-        println!("🧪 Using checker {}", file_name.bold().cyan());
-        bins.push(compile::CHECKER_BIN);
-        generated.push((compile::CHECKER_BIN, checker_src.as_path()));
+    if let Some((bin, source)) = verifier.bin() {
+        println!("🧪 Using {} {}", verifier.label(), file_name(source).bold().cyan());
+        bins.push(bin);
+        generated.push((bin, source));
     }
     let outcome = {
         // The installed sources are removed when this block ends, whatever the outcome.
@@ -262,8 +368,8 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     };
     if let BuildOutcome::Failed { log } = outcome {
         eprintln!("{}", "❌ Compilation failed!".red().bold());
-        if checker_src.is_some() {
-            eprintln!("(the solution and the checker are built together; the log shows which one failed)");
+        if verifier.bin().is_some() {
+            eprintln!("(the solution and the {} are built together; the log shows which one failed)", verifier.label());
         }
         println!("{}", log);
         return Ok(ExitCode::from(1));
@@ -271,7 +377,12 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let release_dir = project_root.join("target/release");
     let workdir = project_root.join("target/judge");
-    if checker_src.is_some() {
+    let mode = match &verifier {
+        Verifier::Builtin => Mode::Batch { checker: None },
+        Verifier::Checker(_) => Mode::Batch { checker: Some(release_dir.join(compile::CHECKER_BIN)) },
+        Verifier::Interactor(_) => Mode::Interactive { interactor: release_dir.join(compile::INTERACTOR_BIN) },
+    };
+    if verifier.bin().is_some() {
         let _ = fs::remove_dir_all(&workdir);
         fs::create_dir_all(&workdir)?;
     }
@@ -285,7 +396,7 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         bin_path: release_dir.join(&package.name),
         project_root: project_root.to_path_buf(),
         limits,
-        checker: checker_src.as_ref().map(|_| release_dir.join(compile::CHECKER_BIN)),
+        mode,
         workdir: workdir.clone(),
     });
 
@@ -296,6 +407,13 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let permits = Arc::new(Semaphore::new(parallelism));
 
     let total_tests = config.tests.len();
+    if total_tests == 0 {
+        println!("{}", "⚠️  The .prob file has no tests; nothing will run.".yellow());
+        if config.interactive {
+            println!("   For an interactive problem, add tests whose input is what the interactor reads (e.g. the hidden number).");
+        }
+    }
+
     let mut handles = Vec::new();
     for (i, test) in config.tests.into_iter().enumerate() {
         let judge = Arc::clone(&judge);
@@ -312,16 +430,23 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     for handle in handles {
         let (i, test, outcome) = handle.await.expect("Failed to join task");
         let test_label = format!("Test #{}", i + 1);
-        if print_outcome(&test_label, &test, &limits, outcome) {
+        if print_outcome(&test_label, &test, &limits, verifier.label(), outcome) {
             passed_count += 1;
         }
     }
 
-    if checker_src.is_some() && passed_count < total_tests {
-        println!(
-            "\nℹ️  Checker files for test N are in {}: N.in, N.out (program output), N.ans (stored answer)",
-            workdir.display()
-        );
+    if passed_count < total_tests {
+        match &verifier {
+            Verifier::Builtin => {}
+            Verifier::Checker(_) => println!(
+                "\nℹ️  Checker files for test N are in {}: N.in, N.out (program output), N.ans (stored answer)",
+                workdir.display()
+            ),
+            Verifier::Interactor(_) => println!(
+                "\nℹ️  The interactor's input file for test N is {}/N.in",
+                workdir.display()
+            ),
+        }
     }
 
     let final_text = format!("\nFinal Score: {}/{}", passed_count, total_tests);

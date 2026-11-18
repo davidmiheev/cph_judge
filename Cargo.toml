@@ -2,6 +2,8 @@
 name = "cph_judge"
 version = "0.1.0"
 edition = "2024"
+# std::io::pipe (interactive problems) needs 1.87; let-chains in edition 2024 need 1.88.
+rust-version = "1.88"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

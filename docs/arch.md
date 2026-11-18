@@ -18,6 +18,8 @@ flowchart TD
     E -- Success --> G["Spawn Tokio Async Test Tasks (at most one running per core)"]
     G --> H["run_once: stdin writer thread + stdout/stderr readers + wait4, wall-clock cap"]
     H --> H2["RunReport::check: CPU-time TLE, RE, MLE"]
+    G -. "interactive: true" .-> H3["interact: solution and A_interactor.rs joined by two pipes, first failure wins"]
+    H3 --> I
     H2 --> I["Collect Verdicts (AC, WA, TLE, MLE, RE)"]
     I --> J["Output check: custom checker if present, else tokenized / float-aware comparison"]
     J --> K["Colored Test Results, RE Traces & Final Score"]
@@ -44,10 +46,13 @@ flowchart TD
 ### 3. Solution Compilation (`compile.rs`)
 - Copies the solution file to the target crate's `src/main.rs`.
 - Reads `Cargo.toml` to extract the package/binary name and the `autobins` setting (`package_info`).
-- If `<solution>_checker.rs` exists next to the solution (`aux_source`), `GeneratedBins` copies it to
-  `src/bin/__judge_checker.rs` for the duration of the build and removes it afterwards. With
-  `autobins = false` this cannot work, so the judge exits with code 2 and an explanation.
-- Executes `cargo build --release --bin <package> [--bin __judge_checker]` (`build_release`),
+- The verifier is chosen from the files next to the solution and the `.prob`'s `interactive` flag
+  (`choose_verifier`): an interactive problem needs `<solution>_interactor.rs`; otherwise
+  `<solution>_checker.rs` is used if present. The chosen file (`aux_source`) is copied by
+  `GeneratedBins` to `src/bin/__judge_checker.rs` or `src/bin/__judge_interactor.rs` for the duration
+  of the build and removed afterwards. With `autobins = false` this cannot work, so the judge exits
+  with code 2 and an explanation.
+- Executes `cargo build --release --bin <package> [--bin __judge_checker | --bin __judge_interactor]` (`build_release`),
   redirecting stderr to `compiler_log.txt`. Building via cargo keeps the project's edition, profile and
   dependencies for every binary.
 - Halts execution and prints logs if compilation fails (a checker that does not compile fails the build).
@@ -100,7 +105,26 @@ When `<solution>_checker.rs` exists, it decides AC/WA instead of the built-in co
 
 The checker only runs for a program that finished within its limits.
 
-### 7. Exit Codes
+### 7. Interactive Problems (`interactive.rs`)
+
+With `"interactive": true` each test runs the solution against `<solution>_interactor.rs`, started as
+`interactor <input_file>` where the input file is `<project>/target/judge/N.in` (the test's `input`).
+
+- Two `std::io::pipe()` pairs connect interactor stdout to solution stdin and solution stdout to
+  interactor stdin. The judge closes its own copies of the pipe ends as soon as both processes have
+  started; otherwise a side closing its end would never be seen as EOF by the other.
+- One supervisor thread per process gathers its status, stderr, CPU time, peak RSS and the time it was
+  reaped; the async loop polls like `run_once` does.
+- Limits: the solution is killed at its CPU limit and both at the wall-clock cap (reported as TLE, with
+  a note if it was the cap). A solution still running after the interactor rejected it is killed at once;
+  an interactor still running 250 ms after the solution failed is killed too.
+- `decide` turns the two reports into a verdict. The interactor's exit code uses the same testlib
+  mapping as checkers. **The first failure wins** (by reaping order) and the other side's failure
+  becomes a note. If the solution left first and the interactor then died of SIGPIPE or panicked with
+  `Broken pipe`, the verdict is a wrong answer ("the solution stopped reading ...").
+- The interactor's verdict replaces the output comparison; a checker, if present, is ignored.
+
+### 8. Exit Codes
 
 | Code | Meaning |
 |---|---|
@@ -108,19 +132,21 @@ The checker only runs for a program that finished within its limits.
 | 1 | Compilation failed, or at least one test did not pass |
 | 2 | Usage error, or the judge itself could not run (e.g. `.prob` not found) |
 
-### 8. Source Layout
+### 9. Source Layout
 
 | File | Contents |
 |---|---|
 | `src/main.rs` | CLI, problem discovery, orchestration, result printing |
 | `src/compile.rs` | `package_info`, `aux_source`, `GeneratedBins`, `build_release` |
-| `src/checker.rs` | `run_checker`, `interpret` (exit code → `Verdict`) |
-| `src/runner.rs` | `run_once`, `RunReport::check`, `Limits`, `RunError` |
+| `src/checker.rs` | `run_checker`, `interpret`, `exit_verdict` (testlib exit code → `Verdict`, shared with interactors) |
+| `src/interactive.rs` | `run_interaction`, `decide`, `interact` |
+| `src/runner.rs` | `run_once`, `RunReport::check`, `violation`, `Limits`, `RunError`, `format_exit_status` |
 | `src/compare.rs` | `compare_outputs` |
 
-Tests: unit tests live next to the code; `tests/checker.rs` builds throwaway Cargo projects and runs the real binary.
+Tests: unit tests live next to the code. `tests/checker.rs`, `tests/interactive.rs` and `tests/paths.rs`
+build throwaway Cargo projects (helpers in `tests/common/`) and run the real binary.
 
-Planned interactive and stress features: see [`design-stress-interactive.md`](design-stress-interactive.md).
+Planned stress features: see [`design-stress-interactive.md`](design-stress-interactive.md).
 
 ---
 

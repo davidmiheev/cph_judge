@@ -14,6 +14,8 @@ use std::{
 
 /// Name of the Cargo binary built from the user's `<solution>_checker.rs`.
 pub const CHECKER_BIN: &str = "__judge_checker";
+/// Name of the Cargo binary built from the user's `<solution>_interactor.rs`.
+pub const INTERACTOR_BIN: &str = "__judge_interactor";
 
 #[derive(Deserialize)]
 struct CargoToml {
@@ -47,17 +49,20 @@ pub fn package_info(project_root: &Path) -> Result<PackageInfo, Box<dyn std::err
     })
 }
 
-/// Path of an auxiliary source that sits next to the solution and is named after it
-/// with a suffix: kind `checker` turns `A.rs` into `A_checker.rs`. Returns it only if
-/// the file exists.
-pub fn aux_source(src_path: &Path, kind: &str) -> Option<PathBuf> {
-    let stem = src_path.file_stem()?.to_string_lossy();
+/// Where an auxiliary source belongs: next to the solution, named after it with a
+/// suffix. Kind `checker` turns `A.rs` into `A_checker.rs`.
+pub fn aux_path(src_path: &Path, kind: &str) -> PathBuf {
+    let stem = src_path.file_stem().unwrap_or_default().to_string_lossy();
     let name = match src_path.extension() {
         Some(ext) => format!("{stem}_{kind}.{}", ext.to_string_lossy()),
         None => format!("{stem}_{kind}"),
     };
-    let path = src_path.with_file_name(name);
-    path.is_file().then_some(path)
+    src_path.with_file_name(name)
+}
+
+/// The auxiliary source of this kind, if the file exists.
+pub fn aux_source(src_path: &Path, kind: &str) -> Option<PathBuf> {
+    Some(aux_path(src_path, kind)).filter(|path| path.is_file())
 }
 
 /// Judge-owned source files placed in the project's `src/bin/` while it is built.

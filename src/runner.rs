@@ -13,6 +13,7 @@ use std::{
     ffi::OsStr,
     io::{Read, Write},
     path::Path,
+    os::unix::process::ExitStatusExt,
     process::{Command, ExitStatus, Stdio},
     sync::{
         Arc,
@@ -23,7 +24,7 @@ use std::{
 use wait4::Wait4;
 
 /// How often a running process is checked against its CPU and wall-clock limits.
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub enum RunError {
@@ -70,20 +71,47 @@ pub struct RunOutput {
     pub max_rss: u64,
 }
 
+/// Which limit, if any, a finished process broke. Precedence: TLE, then RE, then MLE.
+pub fn violation(
+    status: ExitStatus,
+    stderr: &[u8],
+    cpu_time: Duration,
+    max_rss: u64,
+    limits: &Limits,
+) -> Option<RunError> {
+    if cpu_time > limits.time {
+        return Some(RunError::Tle);
+    }
+    if !status.success() {
+        return Some(RunError::Re { status, stderr: String::from_utf8_lossy(stderr).into_owned() });
+    }
+    if max_rss > limits.memory_bytes {
+        return Some(RunError::Mle);
+    }
+    None
+}
+
+/// Human-readable description of how a process ended.
+pub fn format_exit_status(status: ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        format!("exit code {}", code)
+    } else if let Some(sig) = status.signal() {
+        match sig {
+            6 => "SIGABRT (abort / panic)".to_string(),
+            8 => "SIGFPE (div by zero / arithmetic error)".to_string(),
+            11 => "SIGSEGV (segmentation fault / memory error)".to_string(),
+            sig => format!("signal {}", sig),
+        }
+    } else {
+        "terminated unexpectedly".to_string()
+    }
+}
+
 impl RunReport {
     /// Applies the limits. Precedence: TLE, then RE, then MLE.
     pub fn check(self, limits: &Limits) -> Result<RunOutput, RunError> {
-        if self.cpu_time > limits.time {
-            return Err(RunError::Tle);
-        }
-        if !self.status.success() {
-            return Err(RunError::Re {
-                status: self.status,
-                stderr: String::from_utf8_lossy(&self.stderr).into_owned(),
-            });
-        }
-        if self.max_rss > limits.memory_bytes {
-            return Err(RunError::Mle);
+        if let Some(error) = violation(self.status, &self.stderr, self.cpu_time, self.max_rss, limits) {
+            return Err(error);
         }
         Ok(RunOutput {
             stdout: String::from_utf8_lossy(&self.stdout).into_owned(),
@@ -206,13 +234,13 @@ const CLOCK_TICKS_PER_SEC: u64 = 100;
 /// CPU time (user + system) a running process has used so far, or `None` where it
 /// cannot be read (non-Linux platforms, or the process is gone).
 #[cfg(target_os = "linux")]
-fn process_cpu_time(pid: u32) -> Option<Duration> {
+pub(crate) fn process_cpu_time(pid: u32) -> Option<Duration> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_stat_cpu_time(&stat)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_cpu_time(_pid: u32) -> Option<Duration> {
+pub(crate) fn process_cpu_time(_pid: u32) -> Option<Duration> {
     None
 }
 
@@ -229,7 +257,7 @@ fn parse_stat_cpu_time(stat: &str) -> Option<Duration> {
     Some(Duration::from_millis((utime + stime) * 1000 / CLOCK_TICKS_PER_SEC))
 }
 
-fn kill_process_tree(pid: u32) {
+pub(crate) fn kill_process_tree(pid: u32) {
     let _ = Command::new("pkill")
         .arg("-9")
         .arg("-P")
@@ -244,8 +272,6 @@ fn kill_process_tree(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::ExitStatusExt;
-
     const NO_ARGS: [&str; 0] = [];
 
     fn report(exit_raw: i32, cpu_ms: u64, max_rss: u64) -> RunReport {

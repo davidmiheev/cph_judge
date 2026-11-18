@@ -13,7 +13,7 @@
 //! Anything else (another exit code, a crash, a timeout) is also a checker failure,
 //! reported separately so it is never mistaken for a wrong answer by the solution.
 
-use std::{os::unix::process::ExitStatusExt, path::Path, time::Duration};
+use std::{os::unix::process::ExitStatusExt, path::Path, process::ExitStatus, time::Duration};
 
 use crate::runner::{Limits, RunError, RunReport, run_once};
 
@@ -48,17 +48,24 @@ pub fn interpret(report: &RunReport) -> Verdict {
     if report.cpu_time > TIME_LIMIT {
         return Verdict::Failed(format!("checker timed out after {}s", TIME_LIMIT.as_secs()));
     }
-    let message = message(&report.stderr);
-    match report.status.code() {
+    exit_verdict("checker", report.status, &report.stderr)
+}
+
+/// The testlib exit-code convention, shared by checkers and interactors: 0 OK, 1 WA,
+/// 2 PE, 3 judge failure; anything else (another code, a crash) is also a failure of
+/// the program `who` names, never a verdict about the solution.
+pub fn exit_verdict(who: &str, status: ExitStatus, stderr: &[u8]) -> Verdict {
+    let message = message(stderr);
+    match status.code() {
         Some(0) => Verdict::Ok,
         Some(1) => Verdict::Wrong(message),
         Some(2) => Verdict::Presentation(message),
-        Some(3) => Verdict::Failed(with_message("checker reported a judge-side failure", &message)),
-        Some(code) => Verdict::Failed(with_message(&format!("checker exited with unexpected code {code}"), &message)),
+        Some(3) => Verdict::Failed(with_message(&format!("{who} reported a judge-side failure"), &message)),
+        Some(code) => Verdict::Failed(with_message(&format!("{who} exited with unexpected code {code}"), &message)),
         None => {
-            let how = match report.status.signal() {
-                Some(sig) => format!("checker was killed by signal {sig}"),
-                None => "checker terminated unexpectedly".to_string(),
+            let how = match status.signal() {
+                Some(sig) => format!("{who} was killed by signal {sig}"),
+                None => format!("{who} terminated unexpectedly"),
             };
             Verdict::Failed(with_message(&how, &message))
         }
@@ -85,7 +92,6 @@ fn message(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::ExitStatus;
 
     fn report(status_raw: i32, stderr: &str, cpu: Duration) -> RunReport {
         RunReport {
@@ -150,6 +156,15 @@ mod tests {
         // Even an exit-0 checker is not trusted if it overran its own limit.
         match interpret(&report(0, "", TIME_LIMIT + Duration::from_millis(1))) {
             Verdict::Failed(m) => assert!(m.contains("timed out"), "{m}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exit_verdict_names_the_program_that_failed() {
+        let status = ExitStatus::from_raw(42 << 8);
+        match exit_verdict("interactor", status, b"") {
+            Verdict::Failed(m) => assert!(m.starts_with("interactor exited"), "{m}"),
             other => panic!("expected Failed, got {other:?}"),
         }
     }

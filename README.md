@@ -12,6 +12,7 @@ A fast, concurrent competitive programming judge written in Rust, designed to wo
   - **Time Limits (TLE)**: Judged on CPU time and enforced live (Linux), with a wall-clock cap and process-tree cleanup for hung processes.
   - **Memory Limits (MLE)**: Peak resident set size tracking using `wait4` / `rusage`.
   - **Runtime Errors (RE)**: Robust exit code and signal failure detection.
+- **Interactive Problems**: Put a `<solution>_interactor.rs` next to your solution; the judge connects the two with pipes and takes the verdict from the interactor.
 - **Custom Checkers**: Drop a `<solution>_checker.rs` next to your solution to judge problems with several valid answers (testlib-style protocol).
 - **Tokenized & Float-Aware Comparison**: Token-by-token comparison with automatic floating-point epsilon tolerance ($\epsilon = 10^{-6}$) and whitespace insensitivity.
 - **Colored Visual Feedback**: Clean, colored terminal output with execution time and memory stats.
@@ -72,6 +73,38 @@ code and may explain on stderr:
 The three files for test N are kept in `<project>/target/judge/N.in`, `N.out` and `N.ans`, so a failing test
 can be re-checked by hand. Checkers are written in Rust for now. With `autobins = false` in `Cargo.toml` the
 judge cannot build a checker and says so.
+
+### Interactive problems
+
+For a problem marked `"interactive": true` in its `.prob` file (Competitive Companion sets this), write the
+judge's side of the conversation as an interactor next to the solution: `A.rs` is judged against
+`A_interactor.rs`. It is built with the solution and started once per test as:
+
+```
+interactor <input_file>
+```
+
+Its stdin is the solution's stdout and its stdout is the solution's stdin. `<input_file>` holds the test's
+`input` from the `.prob`, so put what the interactor needs there (a hidden number, a graph); the stored
+`output` is not used. The samples the `.prob` starts with may show the conversation rather than data
+your interactor can read, so check them and edit the tests' inputs to match your interactor. The
+interactor reports through its exit code, with a message on stderr:
+
+| Exit code | Verdict |
+|---|---|
+| 0 | AC |
+| 1 | WA (the interactor's message is shown) |
+| 2 | PE |
+| 3, any other code or a crash | `interactor failed`: counted as not passed, never reported as WA |
+
+The solution's time and memory limits apply to the solution alone. If both programs fail, the one that
+failed first gets the blame and the other side's failure is shown as a note; a solution that stops reading
+too early gets a wrong answer rather than blaming the interactor. If the problem is marked interactive but
+there is no interactor, the judge stops and says which file it expected. A checker is ignored for
+interactive problems, and an interactor is ignored for problems that are not marked interactive. Like
+checkers, interactors are written in Rust for now and cannot be built if `Cargo.toml` sets `autobins = false`.
+
+The interactor's input file for test N is kept in `<project>/target/judge/N.in`.
 
 ---
 
