@@ -12,14 +12,14 @@
 flowchart TD
     A["CLI Arguments (search_dir, problem_name)"] --> B["Problem Discovery (WalkBuilder)"]
     B --> C["Parse .prob Metadata (serde_json)"]
-    C --> D["Prepare Solution (Copy source to src/main.rs)"]
-    D --> E["Build Binary (cargo build --release)"]
+    C --> D["Prepare Solution (Copy source to src/main.rs; install A_checker.rs as src/bin/__judge_checker.rs if present)"]
+    D --> E["Build Binary (cargo build --release --bin ...)"]
     E -- Failure --> F["Output Compiler Log & Exit"]
     E -- Success --> G["Spawn Tokio Async Test Tasks (at most one running per core)"]
     G --> H["run_once: stdin writer thread + stdout/stderr readers + wait4, wall-clock cap"]
     H --> H2["RunReport::check: CPU-time TLE, RE, MLE"]
     H2 --> I["Collect Verdicts (AC, WA, TLE, MLE, RE)"]
-    I --> J["Tokenized / Float-Aware Output Comparison"]
+    I --> J["Output check: custom checker if present, else tokenized / float-aware comparison"]
     J --> K["Colored Test Results, RE Traces & Final Score"]
 ```
 
@@ -43,9 +43,14 @@ flowchart TD
 
 ### 3. Solution Compilation (`compile.rs`)
 - Copies the solution file to the target crate's `src/main.rs`.
-- Reads `Cargo.toml` to extract package/binary name (`package_name`).
-- Executes `cargo build --release` (`build_release`), redirecting stderr to `compiler_log.txt`.
-- Halts execution and prints logs if compilation fails.
+- Reads `Cargo.toml` to extract the package/binary name and the `autobins` setting (`package_info`).
+- If `<solution>_checker.rs` exists next to the solution (`aux_source`), `GeneratedBins` copies it to
+  `src/bin/__judge_checker.rs` for the duration of the build and removes it afterwards. With
+  `autobins = false` this cannot work, so the judge exits with code 2 and an explanation.
+- Executes `cargo build --release --bin <package> [--bin __judge_checker]` (`build_release`),
+  redirecting stderr to `compiler_log.txt`. Building via cargo keeps the project's edition, profile and
+  dependencies for every binary.
+- Halts execution and prints logs if compilation fails (a checker that does not compile fails the build).
 
 ### 4. Concurrent Execution Engine (`runner.rs`)
 - `run_once` runs one process and returns a raw `RunReport` (exit status, stdout, stderr,
@@ -68,7 +73,9 @@ flowchart TD
 
 ### 5. Verdict Evaluation
 
-Checked in this order: TLE, RE, MLE, then output comparison.
+Checked in this order: TLE, RE, MLE, then the output check.
+
+The output check is the built-in comparison unless the solution has a checker (see below).
 
 | Verdict | Trigger Condition | Display |
 |---|---|---|
@@ -78,7 +85,22 @@ Checked in this order: TLE, RE, MLE, then output comparison.
 | **MLE** (Memory Limit Exceeded) | Peak RSS exceeded `memoryLimit` | `💾 Test #N MLE (limit)` |
 | **RE** (Runtime Error) | Non-zero exit code, signal termination, or panic | `💥 Test #N RE (status)` with crash / panic trace |
 
-### 6. Exit Codes
+### 6. Custom Checker (`checker.rs`)
+
+When `<solution>_checker.rs` exists, it decides AC/WA instead of the built-in comparison. It runs as
+`checker <input_file> <output_file> <answer_file>` (testlib argument order) on files written to
+`<project>/target/judge/N.in`, `N.out`, `N.ans`, where `N.ans` is the expected output stored in the `.prob`.
+
+| Checker exit | Verdict |
+|---|---|
+| 0 | AC |
+| 1 | WA; the checker's stderr message is shown instead of expected/received |
+| 2 | PE (shown as `Test #N PE`) |
+| 3, any other code, a crash or a timeout | `checker failed (...)`: not counted as passed, never labelled WA |
+
+The checker only runs for a program that finished within its limits.
+
+### 7. Exit Codes
 
 | Code | Meaning |
 |---|---|
@@ -86,16 +108,19 @@ Checked in this order: TLE, RE, MLE, then output comparison.
 | 1 | Compilation failed, or at least one test did not pass |
 | 2 | Usage error, or the judge itself could not run (e.g. `.prob` not found) |
 
-### 7. Source Layout
+### 8. Source Layout
 
 | File | Contents |
 |---|---|
 | `src/main.rs` | CLI, problem discovery, orchestration, result printing |
-| `src/compile.rs` | `package_name`, `build_release` |
+| `src/compile.rs` | `package_info`, `aux_source`, `GeneratedBins`, `build_release` |
+| `src/checker.rs` | `run_checker`, `interpret` (exit code → `Verdict`) |
 | `src/runner.rs` | `run_once`, `RunReport::check`, `Limits`, `RunError` |
 | `src/compare.rs` | `compare_outputs` |
 
-Planned checker, interactive and stress features: see [`design-stress-interactive.md`](design-stress-interactive.md).
+Tests: unit tests live next to the code; `tests/checker.rs` builds throwaway Cargo projects and runs the real binary.
+
+Planned interactive and stress features: see [`design-stress-interactive.md`](design-stress-interactive.md).
 
 ---
 

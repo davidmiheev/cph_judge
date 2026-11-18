@@ -12,6 +12,7 @@ A fast, concurrent competitive programming judge written in Rust, designed to wo
   - **Time Limits (TLE)**: Judged on CPU time and enforced live (Linux), with a wall-clock cap and process-tree cleanup for hung processes.
   - **Memory Limits (MLE)**: Peak resident set size tracking using `wait4` / `rusage`.
   - **Runtime Errors (RE)**: Robust exit code and signal failure detection.
+- **Custom Checkers**: Drop a `<solution>_checker.rs` next to your solution to judge problems with several valid answers (testlib-style protocol).
 - **Tokenized & Float-Aware Comparison**: Token-by-token comparison with automatic floating-point epsilon tolerance ($\epsilon = 10^{-6}$) and whitespace insensitivity.
 - **Colored Visual Feedback**: Clean, colored terminal output with execution time and memory stats.
 
@@ -45,9 +46,32 @@ cargo run --release -- <search_dir> <problem_name>
 cargo run --release -- ~/cp/problemset 1840A
 ```
 
----
-
 The process exit code is `0` when every test passes, `1` when compilation fails or a test does not pass, and `2` on a usage error or when the judge itself cannot run.
+
+### Custom checkers
+
+For problems where many outputs are valid, put a checker next to the solution, named after it with a
+`_checker` suffix: `A.rs` is checked by `A_checker.rs`. The judge builds it together with the solution
+(through the same `Cargo.toml`, so edition, profile and dependencies match) and, for every test whose
+program finished within its limits, runs:
+
+```
+checker <input_file> <output_file> <answer_file>
+```
+
+`<answer_file>` holds the expected output stored in the `.prob`. The checker reports through its exit
+code and may explain on stderr:
+
+| Exit code | Verdict |
+|---|---|
+| 0 | AC |
+| 1 | WA (the checker's message is shown) |
+| 2 | PE |
+| 3, any other code, crash or timeout | `checker failed`: counted as not passed, never reported as WA |
+
+The three files for test N are kept in `<project>/target/judge/N.in`, `N.out` and `N.ans`, so a failing test
+can be re-checked by hand. Checkers are written in Rust for now. With `autobins = false` in `Cargo.toml` the
+judge cannot build a checker and says so.
 
 ---
 

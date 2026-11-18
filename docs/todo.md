@@ -10,16 +10,17 @@ Current state and planned improvements for `cph_judge`.
 - [x] **Stdin deadlock fix**: input is written from its own thread, so programs that stream output no longer get a false TLE on large inputs.
 - [x] **CPU-time limits**: TLE is judged on user + system CPU time, with a wall-clock cap for blocked processes; at most one test per core runs at a time.
 - [x] **Clean Exit Codes**: `0` all passed, `1` compile failure or failed tests, `2` usage / judge error.
+- [x] **Special Judge / Custom Checker** (phase 1): `<solution>_checker.rs` next to the solution, testlib argument order and exit codes; see [`design-stress-interactive.md`](design-stress-interactive.md).
 - [x] **Early Kill on CPU Limit**: a running process is polled and killed as soon as its CPU time passes `timeLimit` (Linux), so infinite loops are reported at the limit rather than after the wall-clock cap.
 
 ---
 
 ## High Priority
 
-Checker, interactive and stress work is planned in [`design-stress-interactive.md`](design-stress-interactive.md) (phases 1-5).
+Interactive and stress work is planned in [`design-stress-interactive.md`](design-stress-interactive.md) (phases 2-5).
 
 - [ ] **Safe File Copy / Backup**: Before copying `src_path` to `src/main.rs`, create a backup of any existing `src/main.rs` and restore it after judge execution or on signal/panic. Note: copying a file onto itself (when `srcPath` is the project's own `src/main.rs`) truncates it.
-- [ ] **Special Judge / Custom Checker** (phase 1): `A_checker.rs`, testlib argument order and exit codes.
+- [ ] **Checker Path Override**: let hints name a checker file instead of relying on the `_checker` suffix (arrives with the hints in phase 3).
 - [ ] **Interactive Problems Support** (phase 2): Implement two-way process piping and interactor communication when `interactive: true`.
 - [ ] **Stress Testing** (phases 3-5): `_brute`, `_gen`, inferred generator, shrinking.
 - [ ] **Configurable Floating-Point Tolerance**: Allow per-problem or per-test configuration of $\epsilon$ tolerance (e.g., $10^{-9}$ for high precision problems).

@@ -10,7 +10,9 @@ A competitive programming judge tool written in Rust that discovers `.prob` prob
 |------|---------|
 | `Cargo.toml` | Rust project configuration with `serde`, `ignore`, `toml`, `colored`, `tokio`, and `wait4` |
 | `src/main.rs` | CLI parsing, problem discovery, test orchestration, and result printing |
-| `src/compile.rs` | Reads the package name and runs `cargo build --release` |
+| `src/compile.rs` | Reads the package name and `autobins`, finds auxiliary files, installs them into `src/bin/` for the build, runs `cargo build --release --bin ...` |
+| `src/checker.rs` | Runs a custom `_checker` and maps its exit code to a verdict |
+| `tests/checker.rs` | End-to-end tests: build throwaway Cargo projects and run the real judge |
 | `src/runner.rs` | Runs one process under limits (`run_once`) and turns the report into a verdict (`RunReport::check`) |
 | `src/compare.rs` | Tokenized, float-aware output comparison |
 | `docs/arch.md` | System architecture, pipeline, and verdict documentation |
@@ -37,3 +39,4 @@ A competitive programming judge tool written in Rust that discovers `.prob` prob
 3. **Runner refactor and stdin deadlock fix**: The judge used to write all of a test's input before it started reading output, so a program that streams its output deadlocked on inputs larger than the pipe buffers and was reported as a false TLE (reproduced with a 2 MB input). Input is now written from a separate thread. At the same time the compile and run logic moved out of `main()`.
 4. **CPU-time limits and bounded concurrency**: TLE is judged on user + system CPU time rather than wall-clock time, and tests no longer all start at once, so timings do not inflate with the number of tests. A running process is killed as soon as its CPU time (polled from `/proc` on Linux) passes the limit, and a wall-clock cap (`2 × timeLimit + 500 ms`) still catches blocked processes.
 5. **Exit codes**: `0` all passed, `1` compile failure or failed tests, `2` usage / judge error.
+6. **Custom checkers**: a `<solution>_checker.rs` next to the solution is built together with it and decides AC/WA, so problems with several valid answers are judged correctly instead of being compared to the one stored answer. The build now names its targets (`--bin`) instead of building everything in the project.

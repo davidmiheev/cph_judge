@@ -1,6 +1,6 @@
 # Design: checker, interactive problems, and stress testing
 
-Status: **Phase 0 done**, the rest is planned. See [Phases](#phases).
+Status: **phases 0 and 1 done** (runner, CPU-time limits, `_checker`); the rest is planned. See [Phases](#phases).
 
 All three features are the same machine with different inputs and a different
 oracle (the thing that decides pass/fail):
@@ -23,7 +23,8 @@ sort beside it. For `A.rs`:
 | `A_checker.rs`   | answer checker (normal and stress)          |
 | `A_interactor.rs`| interactor (interactive)                    |
 
-Each can be overridden by path in the hints (see [Hints](#hints)).
+Each is meant to be overridable by path in the hints (see [Hints](#hints)); until the hints exist (phase 3) only
+the suffix convention is implemented.
 
 ## Building the auxiliary binaries
 
@@ -41,8 +42,15 @@ that matter when brute force and solution must behave identically. Checked on th
   fails under `rustc` (`cannot find module or crate`).
 
 Known cost: with `autobins = false` in `Cargo.toml`, `cargo build --bin __judge_*` fails
-(`no bin target named ...`). The judge should detect that and stop with a clear message
-rather than fall back to `rustc`.
+(`no bin target named ...`). The judge detects that (when an auxiliary file is present) and exits
+with code 2 and a clear message rather than falling back to `rustc`. Without auxiliary files the
+setting is irrelevant.
+
+Implemented in phase 1: the build always names its targets (`--bin <package> [--bin __judge_checker]`)
+instead of building every target, so unrelated files in the user's `src/bin/` no longer affect it.
+The installed sources are removed by a drop guard (`GeneratedBins`) whatever the build outcome; a
+user's own `src/bin/` files are never touched, and `src/bin/` itself is removed only if the judge
+created it.
 
 ## Checker (`A_checker.rs`)
 
@@ -62,6 +70,21 @@ comparison is used. Not used for interactive problems (the interactor is the che
 
 Stress sanity check: run `checker(input, brute_out, brute_out)` first. A sound checker must
 accept the jury's own answer, so a rejection means the brute force or the checker is wrong.
+
+Implemented in phase 1 (normal mode):
+
+- The input, the program's output and the stored answer are written to
+  `<project>/target/judge/N.in`, `N.out`, `N.ans` for test N. The directory is recreated at the start
+  of each run and kept afterwards, so a failing test can be re-checked by hand; the judge prints the
+  location when any test did not pass.
+- The checker only runs for a run that finished within its limits; TLE / MLE / RE are reported as before.
+- Checker limits are 10 s CPU and 1 GiB, only to stop a broken checker from hanging the judge.
+- A checker that fails to compile fails the whole build (the solution and checker are built together,
+  and the compile log says which one failed).
+- Checker failures are shown as `checker failed (...)` and count as not passed (exit code 1), but are
+  never labelled WA.
+
+Not yet implemented: the stress sanity check above, and path overrides.
 
 Limitation: checkers are Rust for now (C++ testlib checkers wait for multi-language support).
 
@@ -151,8 +174,8 @@ file. If it strips them, fall back to a sidecar `A.stress.json`.
 
 | # | Scope | Status |
 |---|-------|--------|
-| 0 | Extract `compile` / `run_once` / `check`; fix stdin deadlock; CPU-time limits; bounded concurrency; exit codes | **done** |
-| 1 | `_checker` in normal mode (introduces the extra-binary build, temp files, exit-code mapping) | planned |
+| 0 | Extract `compile` / `run_once` / `check`; fix stdin deadlock; CPU-time limits (killed live at the limit on Linux); bounded concurrency; exit codes | **done** |
+| 1 | `_checker` in normal mode (introduces the extra-binary build, temp files, exit-code mapping) | **done** |
 | 2 | Interactive mode, reusing phase 1 machinery | planned |
 | 3 | Stress with `_gen` / `_brute`, ramping, size-based shrinking, `--save` | planned |
 | 4 | Schema inference and built-in generator, `--show-schema` | planned |
