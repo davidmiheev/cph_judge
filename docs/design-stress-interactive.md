@@ -229,6 +229,42 @@ a string, a repeated block). Lengths and counts are expressions over earlier num
 (`n`, `n-1`, `2*n`, `10^5`, `1e5`). Names are unique across the whole format, so a constraint can name a
 variable without ambiguity.
 
+Expressions also divide (`n*(n-1)/2`, rounding towards zero).
+
+### Trees, graphs and order (`src/graph.rs`)
+
+Three relations between columns, added after the first version of the language:
+
+- **A list of edges.** A `repeat` block whose body is one line of two numbers (`repeat m { u v }`, or
+  `repeat n-1 { u v }`) can carry one constraint on the *pair*, keyed by both names (`"u v": "tree"`): `tree`,
+  `graph`, `graph, connected`, `graph, directed`, with `ordered` (smaller vertex first) on any but `directed`.
+  The vertices are the range of the first column. The generator makes the whole list at once: a tree is built
+  from a random labelled tree whose shape varies (random parents, a path, a star, the last few vertices), a graph
+  by drawing distinct pairs or, when most pairs are wanted, shuffling the unused ones; a connected graph starts
+  from a tree. A request that cannot be met (more edges than pairs, a tree with the wrong number of edges) is a
+  setup problem with the numbers in it.
+- **The number of edges** is an ordinary variable with an ordinary range, so it is *set to match* when a kind of
+  list is chosen: `n-1..n-1` for a tree, `0..n*(n-1)/2` for a graph, `n-1..n*(n-1)/2` if connected,
+  `0..n*(n-1)` if directed. The generator's size limit then makes the edge count grow with the size.
+- **`l <= r`** is not a new constraint: it is `r: l..n`, the lower bound of a column being the column before it
+  in the same line.
+
+*Inference.* A block of rows may be counted by `n-1` as well as by `n`, only when the rows are two or more
+separate numbers (for arrays it let a matrix read as a row plus `n-1` more). With the vertices bounded by one
+number in every sample, a list is a tree if every one is a tree, else a connected graph (only if some sample
+has four or more vertices, so connectivity is not luck), else a simple graph, else a directed one; at least
+three edges in total are needed, and `ordered` is added if every edge is written smaller vertex first. A list
+that has a loop or a repeated edge in any sample gets no relation. Two columns of other rows, never decreasing in
+at least three rows, get `l..hi`.
+
+*The prompt* asks after the variables: for each list of edges (`tree`, `graph` with flags, or `none`, with `?` for
+the syntax), and for each pair of columns of other rows (`l ≤ r in every row?`). Choosing a kind of list also sets
+the number of edges and says so; answering no to an order goes back to the lower bound of the row's first column.
+
+*Reduction* gains one edit: remove a vertex. It gets the highest label (swapping with it), the edges that touch it
+go, and the number of vertices and of edges are lowered. For a tree that is only valid for a leaf, which the
+validity check enforces, so trees shrink leaf by leaf; dropping one edge or lowering `n` alone cannot.
+
 Each variable has one constraint, in the syntax of the `vars` hint and of the `--ask-constraints` prompt:
 `lo..hi` (bounds are expressions), `lo..hi, distinct`, `lo..hi, sorted`, `perm`, `chars a-z`.
 
@@ -290,8 +326,9 @@ reduced input.
   with small samples it explains nearly anything, which made a multitest input parse as five unrelated arrays.
 - **Constraints that cannot be met** (`8` different values from `1..3`) are a setup problem, never a
   counterexample, and the message points at `--ask-constraints`.
-- Samples cannot show what the problem *allows*, only what *occurs*. Trees, simple graphs, connectivity,
-  `l <= r`, "an answer exists" and `sum of n <= ...` cannot be expressed; use `A_gen.rs` for those.
+- Samples cannot show what the problem *allows*, only what *occurs*. "An answer exists", `sum of n <= ...`,
+  bipartite or planar graphs, trees given as parent arrays, and relations beyond those below cannot be
+  expressed; use `A_gen.rs` for those.
 
 ### Size
 

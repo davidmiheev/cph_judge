@@ -965,6 +965,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tree_is_reduced_to_the_smallest_tree_that_still_fails() {
+        // Fails when some vertex has three or more neighbours: the least such tree is a star of four.
+        let s = schema_of(&["n", "repeat n-1 {", "  u v", "}"]);
+        let d = domains_of(&[("n", "1..size"), ("u", "1..n"), ("v", "1..n"), ("u v", "tree")]);
+        let r = reduced(&s, &d, "8\n1 2\n2 3\n3 4\n4 5\n3 6\n6 7\n6 8\n", |t| {
+            let mut degree = std::collections::HashMap::new();
+            for row in rows(t).iter().skip(1) {
+                for v in row {
+                    *degree.entry(*v).or_insert(0) += 1;
+                }
+            }
+            degree.values().any(|&d| d >= 3)
+        })
+        .await;
+        let edges = &rows(&r.input)[1..];
+        assert_eq!(rows(&r.input)[0], [4], "{}", r.input);
+        assert_eq!(edges.len(), 3, "{}", r.input);
+        // Still a valid tree on 1..4 with a vertex of degree 3.
+        assert!(crate::reduce::is_valid(&s, &d, &r.input), "{}", r.input);
+    }
+
+    #[tokio::test]
+    async fn a_graph_loses_vertices_and_edges_until_the_failure_is_bare() {
+        // Fails when there are at least three edges, in a simple graph.
+        let s = schema_of(&["n m", "repeat m {", "  u v", "}"]);
+        let d = domains_of(&[("n", "1..size"), ("m", "0..n*(n-1)/2"), ("u", "1..n"), ("v", "1..n"), ("u v", "graph")]);
+        let r = reduced(&s, &d, "6 7\n1 2\n2 3\n3 4\n4 5\n5 6\n6 1\n1 4\n", |t| rows(t)[0][1] >= 3).await;
+        assert_eq!(rows(&r.input)[0][1], 3, "{}", r.input);
+        // Three edges need at least three vertices; one-step edits may stop at four (a star), which is
+        // a local minimum: reaching a triangle would need a different graph, not a simpler one.
+        assert!((3..=4).contains(&rows(&r.input)[0][0]), "{}", r.input);
+        assert!(crate::reduce::is_valid(&s, &d, &r.input), "{}", r.input);
+    }
+
+    #[tokio::test]
     async fn an_input_that_does_not_fit_the_format_is_not_reduced() {
         let (s, d) = (schema_of(&["n", "a[n]"]), domains_of(&[("n", "1..size"), ("a", "1..9")]));
         assert!(reduce_input(&s, &d, "3\n1 2\n", 4, |_| async { true }).await.is_none());

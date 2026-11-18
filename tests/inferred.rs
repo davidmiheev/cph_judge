@@ -126,6 +126,196 @@ fn a_generator_files_input_is_left_exactly_as_it_made_it() {
     assert_eq!(counterexample_input(&p), "3\n10 20 30\n");
 }
 
+// ---- trees, graphs and l <= r ------------------------------------------------------------------
+
+/// "Print the largest degree of a vertex". Reads `n` (and `m` if `with_m`, else there are `n-1` edges) and the edges.
+fn degree_program(with_m: bool, print: &str) -> String {
+    let read_m = if with_m { "let m = it.next().unwrap();" } else { "let m = n - 1;" };
+    format!(
+        r#"
+use std::io::Read;
+fn main() {{
+    let mut s = String::new();
+    std::io::stdin().read_to_string(&mut s).unwrap();
+    let mut it = s.split_whitespace().map(|t| t.parse::<usize>().unwrap());
+    let n = it.next().unwrap();
+    {read_m}
+    let mut d = vec![0usize; n + 1];
+    for _ in 0..m {{
+        let u = it.next().unwrap();
+        let v = it.next().unwrap();
+        d[u] += 1;
+        d[v] += 1;
+    }}
+    println!("{{}}", {print});
+}}
+"#
+    )
+}
+
+/// The buggy solution only looks at vertex 1.
+fn tree_project(name: &str, with_m: bool, samples: &[(&str, &str)]) -> Project {
+    let p = Project::new("inferred", name);
+    p.solution(&degree_program(with_m, "d[1]")).brute(&degree_program(with_m, "d.iter().max().unwrap()")).problem(samples);
+    p
+}
+
+const TREE_SAMPLES: [(&str, &str); 2] = [("4\n1 2\n2 3\n3 4\n", "2\n"), ("3\n1 2\n1 3\n", "2\n")];
+
+/// The degree of every vertex in a counterexample that starts with `n` and then lists `n-1` edges.
+fn degrees(input: &str) -> Vec<usize> {
+    let mut lines = input.lines();
+    let n: usize = lines.next().unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    let mut d = vec![0; n + 1];
+    for line in lines {
+        for v in line.split_whitespace() {
+            d[v.parse::<usize>().unwrap()] += 1;
+        }
+    }
+    d
+}
+
+#[test]
+fn a_tree_is_inferred_generated_and_reduced_to_a_small_tree() {
+    let p = tree_project("tree", false, &TREE_SAMPLES);
+    let r = p.run_with(&["--stress", "--seed", "1"]);
+    assert_eq!(r.code, Some(1), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("repeat n-1 {") && r.stdout.contains("u v: tree, ordered"), "{}", r.stdout);
+
+    // Every generated test was a tree (the brute force would have crashed on a bad vertex), and the
+    // reduction left the smallest tree that fools the solution: three vertices, vertex 1 not the centre.
+    let input = counterexample_input(&p);
+    assert_eq!(input.lines().next(), Some("3"), "{input}");
+    assert_eq!(input.lines().count(), 3, "two edges: {input}");
+    let d = degrees(&input);
+    assert!(d[1] < *d.iter().max().unwrap(), "vertex 1 must not be the busiest: {input}");
+    assert!(r.stdout.contains("then reduced in"), "{}", r.stdout);
+}
+
+#[test]
+fn a_correct_solution_survives_stress_testing_on_trees() {
+    let p = tree_project("tree_ok", false, &TREE_SAMPLES);
+    p.solution(&degree_program(false, "d.iter().max().unwrap()"));
+    let r = p.run_with(&["--stress", "--seed", "1", "--iters", "300"]);
+    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+}
+
+#[test]
+fn show_schema_prints_the_tree_constraint_as_a_hint() {
+    let p = tree_project("tree_schema", false, &TREE_SAMPLES);
+    let r = p.run_with(&["--stress", "--show-schema"]);
+    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert!(r.stdout.contains(r#""u v": "tree, ordered""#), "{}", r.stdout);
+    assert!(r.stdout.contains(r#""repeat n-1 {""#), "{}", r.stdout);
+}
+
+#[test]
+fn a_hint_can_ask_for_a_tree_without_the_samples_saying_so() {
+    // Forests in the samples; the hint says the edges form a tree.
+    let p = tree_project("tree_hint", true, &[("5 3\n1 2\n2 3\n4 5\n", "2\n"), ("4 2\n1 2\n3 4\n", "1\n")]);
+    p.problem_with_hints(
+        &[("5 3\n1 2\n2 3\n4 5\n", "2\n"), ("4 2\n1 2\n3 4\n", "1\n")],
+        r#"{"vars":{"u v":"tree","m":"n-1..n-1"}}"#,
+    );
+    let r = p.run_with(&["--stress", "--seed", "1"]);
+    assert_eq!(r.code, Some(1), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    let first = counterexample_input(&p);
+    let header: Vec<usize> = first.lines().next().unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
+    assert_eq!(header[1], header[0] - 1, "a tree: {first}");
+    assert!(r.stdout.contains("do not connect") || r.stdout.contains("a tree on"), "the forest samples are warned about: {}", r.stdout);
+}
+
+#[test]
+fn the_prompt_asks_about_edges_and_sets_the_edge_count_to_match() {
+    let p = tree_project("tree_prompt", true, &[("5 3\n1 2\n2 3\n4 5\n", "2\n"), ("4 2\n1 2\n3 4\n", "1\n")]);
+    // Enter for n, m, u, v; "tree" for the edges; yes, save.
+    let r = p.run_typing(&["--stress", "--seed", "1", "--ask-constraints"], "\n\n\n\ntree\ny\n");
+    assert_eq!(r.code, Some(1), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("edges u v [graph, ordered]: "), "{}", r.stdout);
+    assert!(r.stdout.contains("→ `m` is now n-1..n-1"), "{}", r.stdout);
+    let saved = fs::read_to_string(p.root.join("sol/A.stress.json")).unwrap();
+    assert!(saved.contains(r#""u v": "tree""#) && saved.contains(r#""m": "n-1..n-1""#), "{saved}");
+
+    let input = counterexample_input(&p);
+    let header: Vec<usize> = input.lines().next().unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
+    assert_eq!(header[1], header[0] - 1, "the tests are trees: {input}");
+
+    // The saved answers are all a later run needs.
+    let later = p.run_with(&["--stress", "--seed", "1"]);
+    assert!(later.stdout.contains("u v: tree") && later.stdout.contains("from the `format` hint"), "{}", later.stdout);
+}
+
+/// Range sums, and a brute force that insists on `l <= r` so that a query the wrong way round shows up.
+const RANGE_BRUTE: &str = r#"
+use std::io::Read;
+fn main() {
+    let mut s = String::new();
+    std::io::stdin().read_to_string(&mut s).unwrap();
+    let mut it = s.split_whitespace().map(|t| t.parse::<usize>().unwrap());
+    let (n, q) = (it.next().unwrap(), it.next().unwrap());
+    let a: Vec<usize> = (0..n).map(|_| it.next().unwrap()).collect();
+    for _ in 0..q {
+        let (l, r) = (it.next().unwrap(), it.next().unwrap());
+        assert!(1 <= l && l <= r && r <= n, "bad query {l} {r}");
+        println!("{}", a[l - 1..r].iter().sum::<usize>());
+    }
+}
+"#;
+
+/// Wrong: forgets the first element of the range.
+const RANGE_BUGGY: &str = r#"
+use std::io::Read;
+fn main() {
+    let mut s = String::new();
+    std::io::stdin().read_to_string(&mut s).unwrap();
+    let mut it = s.split_whitespace().map(|t| t.parse::<usize>().unwrap());
+    let (n, q) = (it.next().unwrap(), it.next().unwrap());
+    let a: Vec<usize> = (0..n).map(|_| it.next().unwrap()).collect();
+    let mut pre = vec![0usize; n + 1];
+    for i in 0..n { pre[i + 1] = pre[i] + a[i]; }
+    for _ in 0..q {
+        let (l, r) = (it.next().unwrap(), it.next().unwrap());
+        println!("{}", pre[r] - pre[l]);
+    }
+}
+"#;
+
+fn range_project(name: &str) -> Project {
+    let p = Project::new("inferred", name);
+    // Two samples with different numbers of queries, and a query on a single element in each (so the
+    // queries are not a simple graph), tell the queries from arrays.
+    p.solution(RANGE_BUGGY).brute(RANGE_BRUTE).problem(&[
+        ("5 3\n3 1 4 1 5\n1 3\n2 5\n4 4\n", "8\n11\n1\n"),
+        ("4 2\n2 2 9 1\n1 4\n2 2\n", "14\n2\n"),
+    ]);
+    p
+}
+
+#[test]
+fn queries_never_have_their_ends_the_wrong_way_round() {
+    let p = range_project("range");
+    let r = p.run_with(&["--stress", "--seed", "1"]);
+    // Not a setup problem ("the brute force failed": a query with l > r): the queries are in order.
+    assert_eq!(r.code, Some(1), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("v: u..n"), "{}", r.stdout);
+    for line in counterexample_input(&p).lines().skip(2) {
+        let q: Vec<usize> = line.split(' ').map(|v| v.parse().unwrap()).collect();
+        assert!(q[0] <= q[1], "{line}");
+    }
+}
+
+#[test]
+fn declining_the_order_at_the_prompt_lets_bad_queries_through() {
+    let p = range_project("range_declined");
+    // A correct solution, so the run goes on until a query the wrong way round turns up.
+    p.solution(RANGE_BRUTE);
+    // Enter for n, m, a, u, v; Enter for the edges; "n" to `u ≤ v`.
+    let r = p.run_typing(&["--stress", "--seed", "1", "--ask-constraints"], "\n\n\n\n\n\nn\n");
+    assert!(r.stdout.contains("u ≤ v in every row? [y]: "), "{}", r.stdout);
+    assert_eq!(r.code, Some(2), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("The brute force failed") && r.stdout.contains("bad query"), "{}", r.stdout);
+}
+
 // ---- hints -------------------------------------------------------------------------------
 
 #[test]

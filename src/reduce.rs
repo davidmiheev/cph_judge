@@ -251,6 +251,9 @@ struct Loc {
 enum Edit {
     /// Take one repetition out of a block counted by a number, and lower that number to match.
     RemoveIteration { block: Loc, iteration: usize, count: Loc, slot: usize },
+    /// Take a vertex out of a list of edges: give it the highest label, drop the edges that touch it, and
+    /// lower the number of vertices (and the number of edges, if that is a number of its own).
+    RemoveVertex { block: Loc, vertex: i64, last: i64, vertices: (Loc, usize), count: Option<(Loc, usize)>, ordered: bool },
     Scalar { at: Loc, slot: usize, to: i64 },
     /// Set one element, or every element (`None`).
     Element { at: Loc, index: Option<usize>, to: i64 },
@@ -266,8 +269,43 @@ fn frame_mut<'a>(doc: &'a mut Doc, path: &[(usize, usize)]) -> &'a mut Doc {
     frame
 }
 
+fn set_scalar(doc: &mut Doc, at: &Loc, slot: usize, value: i64) {
+    let Node::Scalars(values) = &mut frame_mut(doc, &at.frame)[at.item] else { unreachable!("a variable's place holds numbers") };
+    values[slot] = value;
+}
+
+fn scalar_at(doc: &Doc, at: &Loc, slot: usize) -> Option<i64> {
+    let mut frame = doc;
+    for &(item, iteration) in &at.frame {
+        let Node::Repeat(iterations) = frame.get(item)? else { return None };
+        frame = iterations.get(iteration)?;
+    }
+    let Node::Scalars(values) = frame.get(at.item)? else { return None };
+    values.get(slot).copied()
+}
+
 fn apply(doc: &mut Doc, edit: &Edit) {
     match edit {
+        Edit::RemoveVertex { block, vertex, last, vertices, count, ordered } => {
+            let remaining = {
+                let Node::Repeat(iterations) = &mut frame_mut(doc, &block.frame)[block.item] else { unreachable!() };
+                let relabel = |w: i64| if w == *vertex { *last } else if w == *last { *vertex } else { w };
+                for iteration in iterations.iter_mut() {
+                    if let Some(Node::Scalars(row)) = iteration.first_mut() {
+                        row.iter_mut().for_each(|w| *w = relabel(*w));
+                        if *ordered {
+                            row.sort_unstable();
+                        }
+                    }
+                }
+                iterations.retain(|it| !matches!(it.first(), Some(Node::Scalars(row)) if row.contains(last)));
+                iterations.len()
+            };
+            set_scalar(doc, &vertices.0, vertices.1, *last - 1);
+            if let Some((at, slot)) = count {
+                set_scalar(doc, at, *slot, remaining as i64);
+            }
+        }
         Edit::RemoveIteration { block, iteration, count, slot } => {
             let remaining = {
                 let Node::Repeat(iterations) = &mut frame_mut(doc, &block.frame)[block.item] else { unreachable!() };
@@ -317,6 +355,7 @@ fn edits(schema: &Schema, domains: &Domains, doc: &Doc) -> Vec<Edit> {
     }
 
     fn collect(
+        root: &Doc,
         items: &[Item],
         nodes: &[Node],
         frame: &[(usize, usize)],
@@ -366,10 +405,33 @@ fn edits(schema: &Schema, domains: &Domains, doc: &Doc) -> Vec<Edit> {
                             });
                         }
                     }
+                    // A list of edges with a constraint loses a whole vertex at a time.
+                    if let [Item::Scalars(names)] = body.as_slice()
+                        && let [u, v] = names.as_slice()
+                        && let Some(Spec::Edges(edges)) = domains.get(&format!("{u} {v}"))
+                        && let Some(Spec::Range { lo: Expr::Num(1), hi: Expr::Var(vertex_var), .. }) = domains.get(u)
+                        && let Some((_, vertices_at, vertices_slot)) = scope.iter().rev().find(|(name, _, _)| name == vertex_var)
+                        && let Some(n) = scalar_at(root, vertices_at, *vertices_slot)
+                    {
+                        let count = match count {
+                            Expr::Var(var) => scope.iter().rev().find(|(name, _, _)| name == var).map(|(_, loc, slot)| (loc.clone(), *slot)),
+                            _ => None,
+                        };
+                        for vertex in (1..=n).rev() {
+                            out.structural.push(Edit::RemoveVertex {
+                                block: at.clone(),
+                                vertex,
+                                last: n,
+                                vertices: (vertices_at.clone(), *vertices_slot),
+                                count: count.clone(),
+                                ordered: edges.ordered,
+                            });
+                        }
+                    }
                     for (iteration, nodes) in iterations.iter().enumerate() {
                         let mut inner = frame.to_vec();
                         inner.push((index, iteration));
-                        collect(body, nodes, &inner, scope, domains, out);
+                        collect(root, body, nodes, &inner, scope, domains, out);
                     }
                 }
                 _ => {}
@@ -379,7 +441,7 @@ fn edits(schema: &Schema, domains: &Domains, doc: &Doc) -> Vec<Edit> {
     }
 
     let mut out = Collected { structural: vec![], scalars: vec![], arrays: vec![], elements: vec![], chars: vec![] };
-    collect(&schema.items, doc, &[], &mut Vec::new(), domains, &mut out);
+    collect(doc, &schema.items, doc, &[], &mut Vec::new(), domains, &mut out);
     [out.structural, out.scalars, out.arrays, out.elements, out.chars].concat()
 }
 
@@ -559,6 +621,39 @@ mod tests {
         let found = texts(&candidates(&s, &d, &doc_of(&s, "3\ncab\n")));
         assert!(found.contains(&"3\naab\n".to_string()), "{found:?}");
         assert!(found.contains(&"3\ncaa\n".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn a_tree_loses_a_leaf_not_just_an_edge() {
+        let s = schema(&["n", "repeat n-1 {", "  u v", "}"]);
+        let d = domains(&[("n", "1..size"), ("u", "1..n"), ("v", "1..n"), ("u v", "tree")]);
+        // Vertex 2 joins 1, 3 and 4: those three are leaves, and 2 is not.
+        let found = texts(&candidates(&s, &d, &doc_of(&s, "4\n1 2\n2 3\n2 4\n")));
+        assert!(found.contains(&"3\n1 2\n2 3\n".to_string()), "vertex 4 goes: {found:?}");
+        assert!(found.contains(&"3\n2 3\n2 1\n".to_string()), "vertex 1 goes, relabelled: {found:?}");
+        assert!(found.contains(&"3\n1 2\n2 3\n".to_string()), "vertex 3 goes, relabelled: {found:?}");
+        // Taking out the centre would leave no tree, and lowering n alone would leave edges past the end.
+        for text in &found {
+            assert!(is_valid(&s, &d, text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_graph_loses_a_vertex_and_its_edges_and_the_count_follows() {
+        let s = schema(&["n m", "repeat m {", "  u v", "}"]);
+        let d = domains(&[("n", "1..size"), ("m", "0..n*(n-1)/2"), ("u", "1..n"), ("v", "1..n"), ("u v", "graph")]);
+        let found = texts(&candidates(&s, &d, &doc_of(&s, "4 4\n1 2\n2 3\n3 4\n4 1\n")));
+        // Vertex 4 had two edges: both go, and so does one from m.
+        assert!(found.contains(&"3 2\n1 2\n2 3\n".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn an_ordered_list_stays_ordered_when_a_vertex_is_relabelled() {
+        let s = schema(&["n", "repeat n-1 {", "  u v", "}"]);
+        let d = domains(&[("n", "1..size"), ("u", "1..n"), ("v", "1..n"), ("u v", "tree, ordered")]);
+        let found = texts(&candidates(&s, &d, &doc_of(&s, "4\n1 2\n2 3\n2 4\n")));
+        assert!(found.contains(&"3\n2 3\n1 2\n".to_string()), "{found:?}");
+        assert!(found.iter().all(|t| is_valid(&s, &d, t)));
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod compare;
 mod compile;
 mod constraints;
 mod generate;
+mod graph;
 mod hints;
 mod infer;
 mod interactive;

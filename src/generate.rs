@@ -7,7 +7,8 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use crate::schema::{Domains, Env, Item, SIZE, Schema, Spec};
+use crate::graph;
+use crate::schema::{Domains, EdgeSpec, Env, Expr, Item, SIZE, Schema, Spec};
 
 /// A generous bound on the numbers in one input, so a mistaken constraint cannot fill the disk.
 pub const MAX_TOKENS: usize = 2_000_000;
@@ -130,6 +131,15 @@ impl Generator<'_> {
                     }
                 }
                 Item::Repeat { count, body } => {
+                    // A list of edges with a constraint is made as a whole: a tree or a graph.
+                    if let [Item::Scalars(names)] = body.as_slice()
+                        && let [u, v] = names.as_slice()
+                        && let Some(Spec::Edges(edges)) = self.domains.get(&format!("{u} {v}"))
+                    {
+                        let edges = *edges;
+                        self.edge_rows(count, u, &edges).map_err(|e| format!("the list of edges `{u} {v}`: {e}"))?;
+                        continue;
+                    }
                     let count = self.env.eval(count).map_err(|e| format!("in a repeat count: {e}"))?;
                     let count = usize::try_from(count).map_err(|_| format!("a repeat count came out as {count}"))?;
                     for _ in 0..count {
@@ -141,6 +151,26 @@ impl Generator<'_> {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The rows of a list of edges: `count` edges of a tree or simple graph on the vertices of the
+    /// first column's range.
+    fn edge_rows(&mut self, count: &Expr, first_column: &str, edges: &EdgeSpec) -> Result<(), String> {
+        let rows = self.length(count, "the number of edges")?;
+        let Spec::Range { lo, hi, .. } = self.spec(first_column)?.clone() else {
+            return Err(format!("`{first_column}` has no range of vertices"));
+        };
+        let lo = self.env.eval(&lo).map_err(|e| format!("in the lower bound of `{first_column}`: {e}"))?;
+        let hi = self.env.eval(&hi).map_err(|e| format!("in the upper bound of `{first_column}`: {e}"))?;
+        if hi < lo {
+            return Err(format!("the vertices {lo}..{hi} are an empty range"));
+        }
+        self.spend(rows.saturating_add(1))?;
+        let vertices = usize::try_from(hi - lo + 1).map_err(|_| "too many vertices".to_string())?;
+        for (a, b) in graph::make_edges(&mut self.rng, vertices, rows, edges)? {
+            self.lines.push(format!("{} {}", lo + a as i64, lo + b as i64));
         }
         Ok(())
     }
@@ -189,6 +219,7 @@ impl Generator<'_> {
                 Ok(values)
             }
             Spec::Chars(_) => Err(format!("`{name}` is an array of numbers but its constraint is `chars ...`")),
+            Spec::Edges(_) => Err(format!("`{name}` is an array of numbers but its constraint is a list of edges")),
         }
     }
 
@@ -424,6 +455,85 @@ mod tests {
         let s = schema("n\na[n]\nk");
         let d = domains(&[("n", "0..0"), ("a", "1..9"), ("k", "7..7")]);
         assert_eq!(generate(&s, &d, 1, 5).unwrap(), "0\n7\n");
+    }
+
+    // ---- trees and graphs ---------------------------------------------------------------------
+
+    fn edge_lines(text: &str) -> Vec<(i64, i64)> {
+        text.lines().skip(1).map(|l| {
+            let v = numbers(l);
+            (v[0], v[1])
+        }).collect()
+    }
+
+    #[test]
+    fn a_tree_is_a_tree_whatever_the_size() {
+        let s = schema("n\nrepeat n-1 {\n u v\n}");
+        let d = domains(&[("n", "1..size"), ("u", "1..n"), ("v", "1..n"), ("u v", "tree")]);
+        let tree = EdgeSpec { kind: crate::schema::EdgeKind::Tree, directed: false, connected: true, ordered: false };
+        for size in [1, 2, 5, 20] {
+            for seed in 0..60 {
+                let text = generate(&s, &d, seed, size).unwrap();
+                let n = numbers(text.lines().next().unwrap())[0] as usize;
+                assert_eq!(graph::check_edges(&tree, &edge_lines(&text), 1, n), None, "size {size} seed {seed}\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_graph_has_as_many_edges_as_its_count_says_and_none_repeated() {
+        let s = schema("n m\nrepeat m {\n u v\n}");
+        let d = domains(&[("n", "1..size"), ("m", "0..n*(n-1)/2"), ("u", "1..n"), ("v", "1..n"), ("u v", "graph")]);
+        let graph_spec = EdgeSpec { kind: crate::schema::EdgeKind::Graph, directed: false, connected: false, ordered: false };
+        let mut saw_edges = false;
+        for seed in 0..100 {
+            let text = generate(&s, &d, seed, 8).unwrap();
+            let header = numbers(text.lines().next().unwrap());
+            let (n, m) = (header[0] as usize, header[1] as usize);
+            assert_eq!(edge_lines(&text).len(), m, "{text}");
+            assert_eq!(graph::check_edges(&graph_spec, &edge_lines(&text), 1, n), None, "{text}");
+            saw_edges |= m > 0;
+        }
+        assert!(saw_edges);
+    }
+
+    #[test]
+    fn the_edge_count_of_a_graph_grows_with_the_size() {
+        let s = schema("n m\nrepeat m {\n u v\n}");
+        let d = domains(&[("n", "20..20"), ("m", "0..n*(n-1)/2"), ("u", "1..n"), ("v", "1..n"), ("u v", "graph")]);
+        for seed in 0..50 {
+            let m = numbers(generate(&s, &d, seed, 3).unwrap().lines().next().unwrap())[1];
+            assert!(m <= 3, "at size 3 there are at most 3 edges, got {m}");
+        }
+    }
+
+    #[test]
+    fn vertices_may_be_numbered_from_zero_and_edges_ordered() {
+        let s = schema("n\nrepeat n-1 {\n u v\n}");
+        let d = domains(&[("n", "2..size"), ("u", "0..n-1"), ("v", "0..n-1"), ("u v", "tree, ordered")]);
+        for seed in 0..50 {
+            let text = generate(&s, &d, seed, 9).unwrap();
+            assert!(edge_lines(&text).iter().all(|&(u, v)| 0 <= u && u < v), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_impossible_list_of_edges_is_reported_with_which_list() {
+        let s = schema("n m\nrepeat m {\n u v\n}");
+        let d = domains(&[("n", "3..3"), ("m", "5..5"), ("u", "1..n"), ("v", "1..n"), ("u v", "graph")]);
+        let error = generate(&s, &d, 1, 9).unwrap_err();
+        assert!(error.contains("the list of edges `u v`") && error.contains("at most 3"), "{error}");
+        let d = domains(&[("n", "4..4"), ("m", "2..2"), ("u", "1..n"), ("v", "1..n"), ("u v", "tree")]);
+        assert!(generate(&s, &d, 1, 9).unwrap_err().contains("a tree on 4 vertices has 3 edges"));
+    }
+
+    #[test]
+    fn a_list_of_edges_without_its_constraint_is_plain_rows() {
+        let s = schema("n m\nrepeat m {\n u v\n}");
+        let d = domains(&[("n", "2..2"), ("m", "30..30"), ("u", "1..n"), ("v", "1..n")]);
+        // Thirty rows between two vertices: plenty of loops and repeats, which nothing forbids here.
+        let text = generate(&s, &d, 1, 99).unwrap();
+        assert_eq!(edge_lines(&text).len(), 30);
     }
 
     // ---- what goes wrong ---------------------------------------------------------------------

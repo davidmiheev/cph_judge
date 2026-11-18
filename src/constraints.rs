@@ -17,7 +17,8 @@ use std::{
 
 use serde_json::{Map, Value};
 
-use crate::schema::{Domains, SIZE, Schema, Spec, VarKind, Variable, validate_spec};
+use crate::graph::count_range;
+use crate::schema::{Domains, EdgeBlock, Expr, SIZE, Schema, Spec, VarKind, Variable, validate_spec};
 
 pub const SYNTAX: &str = "\
     lo..hi            an integer from lo to hi; bounds may use numbers defined earlier and `size`
@@ -25,6 +26,13 @@ pub const SYNTAX: &str = "\
     lo..hi, distinct  an array whose elements are all different (also: sorted)
     perm              an array that is a permutation of 1..its length
     chars a-z         a string over these characters (chars 01, chars .#)";
+
+pub const EDGE_SYNTAX: &str = "\
+    tree              the edges of a tree: one fewer than the vertices, all connected
+    graph             a simple graph: no loops, no repeated edges
+    graph, connected  ... that is also connected      (or `, directed`: an edge and its reverse differ)
+    ..., ordered      every edge lists its smaller vertex first
+    none              no constraint on the pairs";
 
 /// What the dialogue ended with.
 #[derive(Debug, PartialEq, Eq)]
@@ -80,7 +88,124 @@ pub fn ask<R: BufRead, W: Write>(schema: &Schema, domains: &mut Domains, input: 
             }
         }
     }
+
+    let outcome = ask_relations(schema, domains, input, out)?;
+    Ok(Outcome { changed: changed || outcome.changed, ended: outcome.ended })
+}
+
+/// The questions that are about pairs of columns rather than one variable: whether a list of edges is a
+/// tree or a graph, and whether the second of two columns is never below the first.
+fn ask_relations<R: BufRead, W: Write>(schema: &Schema, domains: &mut Domains, input: &mut R, out: &mut W) -> io::Result<Outcome> {
+    let blocks = schema.edge_blocks();
+    let rows = schema.row_lines();
+    if blocks.is_empty() && rows.is_empty() {
+        return Ok(Outcome { changed: false, ended: false });
+    }
+    writeln!(out, "Relations between columns (Enter keeps the value in brackets, `?` shows the syntax):")?;
+    let mut changed = false;
+
+    for block in &blocks {
+        let key = block.key();
+        loop {
+            let current = domains.get(&key).map(Spec::to_string).unwrap_or_else(|| "none".to_string());
+            write!(out, "  edges {key} [{current}]: ")?;
+            out.flush()?;
+            let mut line = String::new();
+            if input.read_line(&mut line)? == 0 {
+                writeln!(out)?;
+                return Ok(Outcome { changed, ended: true });
+            }
+            let answer = line.trim();
+            if answer.is_empty() {
+                break;
+            }
+            if answer == "?" {
+                writeln!(out, "{EDGE_SYNTAX}")?;
+                continue;
+            }
+            if answer == "none" {
+                changed |= domains.remove(&key).is_some();
+                break;
+            }
+            match Spec::parse(answer) {
+                Ok(Spec::Edges(edges)) => {
+                    let spec = Spec::Edges(edges);
+                    if domains.get(&key) != Some(&spec) {
+                        changed = true;
+                        domains.insert(key.clone(), spec);
+                        if let Some(message) = fit_edge_count(block, &edges, domains) {
+                            writeln!(out, "    → {message}")?;
+                        }
+                    }
+                    break;
+                }
+                Ok(_) => writeln!(out, "    ✗ expected `tree`, `graph` (with flags) or `none`")?,
+                Err(message) => writeln!(out, "    ✗ {message}")?,
+            }
+        }
+    }
+
+    for names in &rows {
+        for pair in names.windows(2) {
+            let (first, second) = (&pair[0], &pair[1]);
+            // The two columns of a list of edges with a constraint have `ordered` for this.
+            if names.len() == 2 && domains.contains_key(&format!("{first} {second}")) {
+                continue;
+            }
+            // "No" goes back to where the row starts: the lower bound of its first column, which no
+            // answer here changes (an earlier answer may have tied the one before this to it).
+            let (Some(Spec::Range { lo: base_lo, .. }), Some(Spec::Range { lo, hi, distinct, sorted })) =
+                (domains.get(&names[0]).cloned(), domains.get(second).cloned())
+            else {
+                continue;
+            };
+            let ordered = lo == Expr::var(first);
+            loop {
+                write!(out, "  {first} ≤ {second} in every row? [{}]: ", if ordered { "y" } else { "n" })?;
+                out.flush()?;
+                let mut line = String::new();
+                if input.read_line(&mut line)? == 0 {
+                    writeln!(out)?;
+                    return Ok(Outcome { changed, ended: true });
+                }
+                let new_lo = match line.trim().to_ascii_lowercase().as_str() {
+                    "" => break,
+                    "y" | "yes" => Expr::var(first),
+                    "n" | "no" => base_lo.clone(),
+                    _ => {
+                        writeln!(out, "    ✗ answer y or n")?;
+                        continue;
+                    }
+                };
+                if new_lo != lo {
+                    changed = true;
+                    domains.insert(second.clone(), Spec::Range { lo: new_lo, hi, distinct, sorted });
+                }
+                break;
+            }
+        }
+    }
     Ok(Outcome { changed, ended: false })
+}
+
+/// Sets the number of edges to what a list of this kind has (`n-1` for a tree, up to `n*(n-1)/2` for a
+/// graph), when it is a number of its own. Says what it did, or why it could not.
+fn fit_edge_count(block: &EdgeBlock, edges: &crate::schema::EdgeSpec, domains: &mut Domains) -> Option<String> {
+    let Some(Spec::Range { hi: Expr::Var(vertices), .. }) = domains.get(&block.columns[0]).cloned() else {
+        return Some(format!(
+            "the vertices of `{}` are not bounded by one number, so set the number of edges yourself",
+            block.columns[0]
+        ));
+    };
+    match &block.count {
+        Expr::Var(count) if matches!(domains.get(count), Some(Spec::Range { .. })) => {
+            let range = count_range(edges, &vertices);
+            domains.insert(count.clone(), Spec::parse(&range).ok()?);
+            Some(format!("`{count}` is now {range}"))
+        }
+        // `n-1` rows and the like: the count is already a formula.
+        _ => None,
+    }
 }
 
 /// The names a constraint of this variable may use.
@@ -243,6 +368,151 @@ mod tests {
         let ask = |typed: &str| confirm("Save?", &mut Cursor::new(typed.as_bytes()), &mut Vec::new()).unwrap();
         assert!(ask("y\n") && ask("Y\n") && ask("yes\n") && ask(" YES \n"));
         assert!(!ask("n\n") && !ask("\n") && !ask("maybe\n") && !ask(""));
+    }
+
+    // ---- relations: edges and order ------------------------------------------------------------
+
+    fn edges_schema() -> Schema {
+        Schema::parse(&["n m", "repeat m {", "  u v", "}"]).unwrap()
+    }
+
+    fn edges_defaults() -> Domains {
+        [("n", "1..size"), ("m", "1..size"), ("u", "1..n"), ("v", "1..n")]
+            .into_iter()
+            .map(|(name, text)| (name.to_string(), Spec::parse(text).unwrap()))
+            .collect()
+    }
+
+    /// Four Enters for the variables `n`, `m`, `u`, `v`, then `typed` for the questions about relations.
+    fn relations(schema: &Schema, defaults: Domains, typed: &str) -> (Outcome, Domains, String) {
+        let mut domains = defaults;
+        let mut out = Vec::new();
+        let outcome = ask(schema, &mut domains, &mut Cursor::new(typed.as_bytes()), &mut out).unwrap();
+        (outcome, domains, String::from_utf8(out).unwrap())
+    }
+
+    fn graph_dialogue(relation_answers: &str) -> (Outcome, Domains, String) {
+        relations(&edges_schema(), edges_defaults(), &format!("\n\n\n\n{relation_answers}"))
+    }
+
+    #[test]
+    fn a_list_of_edges_is_asked_about_after_the_variables() {
+        let (outcome, domains, out) = graph_dialogue("\n\n");
+        assert!(out.contains("Relations between columns"), "{out}");
+        assert!(out.contains("edges u v [none]: "), "{out}");
+        assert!(out.contains("u ≤ v in every row? [n]: "), "{out}");
+        assert_eq!(outcome, Outcome { changed: false, ended: false });
+        assert_eq!(domains, edges_defaults());
+    }
+
+    #[test]
+    fn answering_tree_makes_the_number_of_edges_n_minus_one_and_says_so() {
+        let (outcome, domains, out) = graph_dialogue("tree\n\n");
+        assert_eq!(domains["u v"].to_string(), "tree");
+        assert_eq!(domains["m"].to_string(), "n-1..n-1");
+        assert!(out.contains("→ `m` is now n-1..n-1"), "{out}");
+        assert!(outcome.changed);
+        // The two columns of a list with a constraint have `ordered` for order, so no second question about them.
+        assert!(!out.contains("≤"), "{out}");
+    }
+
+    #[test]
+    fn answering_a_graph_sets_the_number_of_edges_to_what_fits() {
+        let (_, domains, _) = graph_dialogue("graph\n\n");
+        assert_eq!((domains["u v"].to_string(), domains["m"].to_string()), ("graph".to_string(), "0..n*(n-1)/2".to_string()));
+        let (_, domains, _) = graph_dialogue("graph, connected, ordered\n");
+        assert_eq!((domains["u v"].to_string(), domains["m"].to_string()), ("graph, connected, ordered".to_string(), "n-1..n*(n-1)/2".to_string()));
+        let (_, domains, _) = graph_dialogue("graph, directed\n");
+        assert_eq!(domains["m"].to_string(), "0..n*(n-1)");
+    }
+
+    #[test]
+    fn none_removes_a_constraint_on_edges() {
+        let mut defaults = edges_defaults();
+        defaults.insert("u v".to_string(), Spec::parse("tree").unwrap());
+        let (outcome, domains, out) = relations(&edges_schema(), defaults, "\n\n\n\nnone\n\n");
+        assert!(out.contains("edges u v [tree]: "), "{out}");
+        assert!(!domains.contains_key("u v") && outcome.changed);
+    }
+
+    #[test]
+    fn a_wrong_answer_about_edges_is_explained_and_asked_again() {
+        let (_, domains, out) = graph_dialogue("forest\n1..5\ntree, directed\ntree\n\n");
+        assert!(out.contains("✗ expected `lo..hi`") || out.contains("✗ expected `tree`"), "{out}");
+        assert!(out.contains("✗ expected `tree`, `graph` (with flags) or `none`"), "{out}");
+        assert!(out.contains("✗ a tree cannot be `directed`"), "{out}");
+        assert_eq!(domains["u v"].to_string(), "tree");
+    }
+
+    #[test]
+    fn the_question_mark_explains_the_kinds_of_edges() {
+        let (_, _, out) = graph_dialogue("?\ntree\n");
+        assert!(out.contains("a simple graph: no loops, no repeated edges"), "{out}");
+    }
+
+    #[test]
+    fn the_number_of_edges_is_left_alone_when_it_is_already_a_formula() {
+        let schema = Schema::parse(&["n", "repeat n-1 {", "  u v", "}"]).unwrap();
+        let defaults: Domains = [("n", "1..size"), ("u", "1..n"), ("v", "1..n")].into_iter().map(|(a, b)| (a.to_string(), Spec::parse(b).unwrap())).collect();
+        let (_, domains, out) = relations(&schema, defaults, "\n\n\ntree\n");
+        assert_eq!(domains["u v"].to_string(), "tree");
+        assert!(!out.contains("→"), "nothing needed changing: {out}");
+    }
+
+    #[test]
+    fn the_number_of_edges_cannot_be_fitted_without_a_number_of_vertices() {
+        let defaults: Domains = [("n", "1..size"), ("m", "1..size"), ("u", "1..10"), ("v", "1..10")]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), Spec::parse(b).unwrap()))
+            .collect();
+        let (_, domains, out) = relations(&edges_schema(), defaults, "\n\n\n\ntree\n");
+        assert!(out.contains("not bounded by one number"), "{out}");
+        assert_eq!(domains["m"].to_string(), "1..size");
+    }
+
+    #[test]
+    fn two_columns_can_be_asked_to_be_in_order() {
+        // Not edges (three columns), just rows: a, b, c.
+        let schema = Schema::parse(&["n", "repeat n {", "  a b c", "}"]).unwrap();
+        let defaults: Domains = [("n", "1..size"), ("a", "1..9"), ("b", "1..9"), ("c", "1..9")]
+            .into_iter()
+            .map(|(x, y)| (x.to_string(), Spec::parse(y).unwrap()))
+            .collect();
+        let (outcome, domains, out) = relations(&schema, defaults, "\n\n\n\ny\nn\n");
+        assert!(out.contains("a ≤ b in every row? [n]: ") && out.contains("b ≤ c in every row? [n]: "), "{out}");
+        assert_eq!(domains["b"].to_string(), "a..9");
+        assert_eq!(domains["c"].to_string(), "1..9", "answered no");
+        assert!(outcome.changed);
+    }
+
+    #[test]
+    fn an_order_can_be_taken_back() {
+        let schema = Schema::parse(&["n", "repeat n {", "  a b c", "}"]).unwrap();
+        let defaults: Domains = [("n", "1..size"), ("a", "2..9"), ("b", "a..9"), ("c", "1..9")]
+            .into_iter()
+            .map(|(x, y)| (x.to_string(), Spec::parse(y).unwrap()))
+            .collect();
+        let (_, domains, out) = relations(&schema, defaults, "\n\n\n\nn\n\n");
+        assert!(out.contains("a ≤ b in every row? [y]: "), "{out}");
+        assert_eq!(domains["b"].to_string(), "2..9", "back to where `a` starts");
+    }
+
+    #[test]
+    fn a_wrong_order_answer_is_asked_again_and_a_closed_input_ends_the_dialogue() {
+        let schema = Schema::parse(&["n", "repeat n {", "  a b c", "}"]).unwrap();
+        let defaults: Domains = [("n", "1..size"), ("a", "1..9"), ("b", "1..9"), ("c", "1..9")]
+            .into_iter()
+            .map(|(x, y)| (x.to_string(), Spec::parse(y).unwrap()))
+            .collect();
+        let (outcome, _, out) = relations(&schema, defaults, "\n\n\n\nmaybe\ny\n");
+        assert!(out.contains("✗ answer y or n"), "{out}");
+        assert!(outcome.ended, "the input ran out at the second order question");
+    }
+
+    #[test]
+    fn a_format_without_pairs_asks_nothing_about_relations() {
+        let (_, _, out) = dialogue("\n\n\n");
+        assert!(!out.contains("Relations"), "{out}");
     }
 
     // ---- saving --------------------------------------------------------------------------------

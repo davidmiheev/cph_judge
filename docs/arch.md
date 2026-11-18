@@ -159,6 +159,9 @@ Without a generator file a stress test makes its tests inside the judge:
   hints, validates the result, and warns about samples that break the final constraints.
 - `generate.rs` makes a test from a format, constraints, a seed and a size (a splitmix64 generator), limiting
   size variables to the size of the test and refusing impossible constraints or runaway inputs.
+- `graph.rs` makes lists of edges (trees of varied shapes, simple graphs, connected or directed) and checks that a
+  list is one; the generator uses it to make them, the sample checker to warn, and through that the reducer to
+  keep them valid.
 - `reduce.rs` takes a failing input apart into a tree of values and offers single simplifying edits
   (drop a repetition, lower a number, zero an array, simplify a character), each re-normalized so lengths follow
   their numbers and values stay in their constraints, and checked to be a valid input.
@@ -194,6 +197,7 @@ Hints come from an optional `"stress"` object in the `.prob` and from a sidecar 
 | `src/schema.rs` | `Schema` and `Spec` (format and constraints: parse, print, validate), `Expr`, `Env` |
 | `src/infer.rs` | `infer_structure`, `observe`, `default_domains`, `build` |
 | `src/generate.rs` | `generate`, `Rng` |
+| `src/graph.rs` | `make_edges`, `random_tree`, `check_edges`, `count_range` (trees and simple graphs) |
 | `src/reduce.rs` | `parse`/`render` (an input as a tree of values), `normalize`, `candidates` |
 | `src/constraints.rs` | `ask`, `confirm`, `save` |
 | `src/cli.rs` | `parse`, `USAGE` |

@@ -189,13 +189,39 @@ Save the format and constraints in .../A.stress.json so later runs use them? [y/
 | `lo..hi, distinct` | an array whose elements are all different (`sorted` too: non-decreasing) |
 | `perm` | an array that is a permutation of `1..length` |
 | `chars a-z` | a string over these characters (`chars 01`, `chars .#`) |
+| `tree` | for a list of edges (the rows `u v` of a repeated block): the edges of a tree on the vertices, `n-1` of them, all connected |
+| `graph` | ... a simple graph: no loops, no repeated edges; add `, connected`, `, directed` (an edge and its reverse differ) |
+| `..., ordered` | ... every edge lists its smaller vertex first |
+
+A constraint on a list of edges is written under both column names, `"u v": "tree"` in the hints. Bounds may also
+divide, so the number of edges of a graph can be `0..n*(n-1)/2`. `l ≤ r` is just a range that starts at the
+earlier column: `r: l..n`.
+
+**Trees, graphs and ranges.** From the samples the judge recognises a list of edges that is a tree (a block of `n-1`
+rows), a simple graph, a connected graph, a directed graph, and edges always written smaller vertex first, but only
+when *every* sample is one and there are enough edges to mean something. A second column that is never below the
+first in any row (at least three rows) gets a range that starts at the first. The number of edges is then set to
+match (`n-1..n-1` for a tree, `0..n*(n-1)/2` for a graph), and the tests it generates are trees of different
+shapes (random, paths, stars) or graphs of that kind. A graph that cannot exist (five edges on three vertices) is a
+problem with the setup, not a counterexample. A counterexample reduces by removing whole vertices: a leaf of a
+tree, or a vertex and its edges.
+
+With `--ask-constraints`, after the variables the prompt asks about each list of edges and each pair of columns:
+
+```
+Relations between columns (Enter keeps the value in brackets, `?` shows the syntax):
+  edges u v [graph, ordered]: tree
+    → `m` is now n-1..n-1
+  l ≤ r in every row? [y]:
+```
 
 Saving writes the format and the constraints to `A.stress.json`, so the next run needs no typing. The same thing
 can be written by hand in the `vars` (constraints by name), `format` (the input's shape, one line per entry) and
 `multitest` (whether the first number counts the tests) hints; `--show-schema` prints them ready to paste.
 
-What the constraint language cannot say: that edges form a tree or a simple graph, `l <= r`, "an answer exists",
-a limit on the sum of the lengths. For those, write `A_gen.rs`. Constraints that allow no input (eight different
+What the constraint language cannot say: that a graph is bipartite or planar, a tree given as a list of parents, a
+weight on each edge that depends on the edge, "an answer exists", a limit on the sum of the lengths. For those, write
+`A_gen.rs`. Constraints that allow no input (eight different
 numbers from `1..3`) are reported as a problem with the setup, not as a counterexample.
 
 #### Hints

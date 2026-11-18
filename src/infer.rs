@@ -20,7 +20,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::hints::Hints;
-use crate::schema::{Domains, Env, Expr, Item, Op, SIZE, Schema, Spec, VarKind, validate_domains};
+use crate::graph::{check_edges, count_range};
+use crate::schema::{Domains, EdgeKind, EdgeSpec, Env, Expr, Item, Op, SIZE, Schema, Spec, VarKind, validate_domains};
 
 // ---- reading the samples ---------------------------------------------------------------
 
@@ -246,11 +247,14 @@ fn join_or(names: &[String]) -> String {
 fn rows_plans(st: &State, namer: &Namer) -> Vec<(Plan, Namer)> {
     let mut plans = Vec::new();
     let samples = st.samples.len();
-    for (i, name) in st.names.iter().enumerate() {
+    // Counted by a number, or by one less (the edges of a tree): the plain number is the likelier.
+    let counted_by: Vec<(i64, usize, &String)> =
+        [0, -1].into_iter().flat_map(|offset| st.names.iter().enumerate().map(move |(i, name)| (offset, i, name))).collect();
+    for (offset, i, name) in counted_by {
         if st.used[i] {
             continue;
         }
-        let counts: Vec<i64> = st.values.iter().map(|v| v[i]).collect();
+        let counts: Vec<i64> = st.values.iter().map(|v| v[i] + offset).collect();
         if counts.iter().any(|&c| c < 0) || counts.iter().all(|&c| c == 0) {
             continue;
         }
@@ -261,11 +265,16 @@ fn rows_plans(st: &State, namer: &Namer) -> Vec<(Plan, Namer)> {
         let rows: Vec<&[Vec<Token>]> = (0..samples).map(|s| &st.samples[s][st.pos[s]..st.pos[s] + counts[s]]).collect();
         let mut trial = namer.clone();
         if let Some((body, body_uses)) = row_body(st, &rows, &mut trial) {
+            // One fewer than a number counts the edges of a tree: rows of at least two separate numbers.
+            // For anything else it would let a matrix read as a row plus `n-1` more.
+            if offset != 0 && !matches!(&body, Item::Scalars(names) if names.len() >= 2) {
+                continue;
+            }
             let mut uses = vec![i];
             uses.extend(body_uses);
             plans.push((
                 Plan {
-                    item: Item::Repeat { count: Expr::var(name), body: vec![body] },
+                    item: Item::Repeat { count: expr_for(name, offset), body: vec![body] },
                     advance: counts,
                     defines: Vec::new(),
                     uses,
@@ -587,9 +596,19 @@ pub struct VarObs {
     pub chars: BTreeSet<char>,
 }
 
+/// One list of edges as it appeared in a sample.
+#[derive(Clone, Debug)]
+pub struct EdgeObs {
+    pub rows: Vec<(i64, i64)>,
+    /// The integers in scope where the list began.
+    pub visible: Vec<(String, i64)>,
+}
+
 #[derive(Debug, Default)]
 pub struct Observed {
     pub vars: BTreeMap<String, VarObs>,
+    /// The lists of edges (blocks of rows of two numbers), by the key of their constraint (`u v`).
+    pub edge_lists: BTreeMap<String, Vec<EdgeObs>>,
     /// Places where a sample breaks the constraints that were given (only with `domains`).
     pub violations: Vec<String>,
 }
@@ -696,16 +715,44 @@ impl Walker<'_> {
                     if !(0..=10_000_000).contains(&times) {
                         return Err(self.fail(format!("a repeat count is {times}")));
                     }
+                    let list = match body.as_slice() {
+                        [Item::Scalars(names)] if names.len() == 2 => Some((names[0].clone(), names[1].clone())),
+                        _ => None,
+                    };
+                    let entry = self.env.visible();
+                    let first_row = list.as_ref().map_or(0, |(u, _)| self.observed.vars.get(u).map_or(0, |o| o.instances.len()));
                     for _ in 0..times {
                         self.env.push();
                         let result = self.items(body);
                         self.env.pop();
                         result?;
                     }
+                    if let Some((u, v)) = list {
+                        self.finish_edge_list(&u, &v, first_row, entry);
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Records the list of edges just read (its rows are the instances of its two columns since
+    /// `first_row`) and, if it has a constraint, checks it.
+    fn finish_edge_list(&mut self, u: &str, v: &str, first_row: usize, visible: Vec<(String, i64)>) {
+        let column = |observed: &Observed, name: &str| -> Vec<i64> {
+            observed.vars.get(name).map_or(Vec::new(), |o| o.instances[first_row..].iter().map(|i| i.values[0]).collect())
+        };
+        let rows: Vec<(i64, i64)> = column(self.observed, u).into_iter().zip(column(self.observed, v)).collect();
+        let key = format!("{u} {v}");
+        if let Some(Spec::Edges(spec)) = self.domains.and_then(|d| d.get(&key))
+            && let Some(Spec::Range { lo, hi, .. }) = self.domains.and_then(|d| d.get(u))
+            && let Some((lo, hi)) = self.bounds(u, lo, hi)
+            && hi >= lo
+            && let Some(problem) = crate::graph::check_edges(spec, &rows, lo, (hi - lo + 1) as usize)
+        {
+            self.violation(format!("the edges `{key}`: {problem}"));
+        }
+        self.observed.edge_lists.entry(key).or_default().push(EdgeObs { rows, visible });
     }
 
     /// An error that points at the line just read.
@@ -887,7 +934,87 @@ pub fn default_domains(schema: &Schema, observed: &Observed) -> Domains {
         };
         domains.insert(name.clone(), spec);
     }
+    infer_edge_lists(schema, observed, &bounds, &mut domains);
+    infer_row_order(schema, observed, &mut domains);
     domains
+}
+
+/// Whether every list of edges read under `key` (a pair of columns) passes `test`, with the number of
+/// vertices taken from the variable `vertices`.
+fn all_lists(observed: &Observed, key: &str, vertices: &str, test: impl Fn(&[(i64, i64)], usize) -> bool) -> bool {
+    let Some(lists) = observed.edge_lists.get(key) else { return false };
+    lists.iter().all(|list| {
+        list.visible
+            .iter()
+            .rev()
+            .find(|(name, _)| name == vertices)
+            .is_some_and(|(_, n)| usize::try_from(*n).is_ok_and(|n| test(&list.rows, n)))
+    })
+}
+
+/// A list of edges is a tree or a simple graph if every one in the samples is, and there are enough
+/// edges to mean something. The number of edges is then set to match (a tree has `n-1`).
+fn infer_edge_lists(schema: &Schema, observed: &Observed, bounds: &BTreeMap<String, String>, domains: &mut Domains) {
+    for block in schema.edge_blocks() {
+        let [u, v] = &block.columns;
+        let key = block.key();
+        let (Some(bu), Some(bv)) = (bounds.get(u), bounds.get(v)) else { continue };
+        let Some(lists) = observed.edge_lists.get(&key) else { continue };
+        let total: usize = lists.iter().map(|l| l.rows.len()).sum();
+        if bu != bv || total < 3 {
+            continue; // the vertices are not bounded by one number, or too few edges to tell
+        }
+        let vertices = bu;
+
+        let rows_ordered = lists.iter().all(|l| l.rows.iter().all(|&(a, b)| a < b));
+        let wide_enough = lists.iter().any(|l| {
+            l.visible.iter().rev().find(|(name, _)| name == vertices).is_some_and(|(_, n)| *n >= 4)
+        });
+        let spec = |kind, directed, connected| EdgeSpec { kind, directed, connected: connected || kind == EdgeKind::Tree, ordered: rows_ordered && !directed };
+        let candidates = [
+            spec(EdgeKind::Tree, false, true),
+            // Connectivity is only believed with room for it not to be an accident.
+            spec(EdgeKind::Graph, false, wide_enough),
+            spec(EdgeKind::Graph, false, false),
+            spec(EdgeKind::Graph, true, false),
+        ];
+        let Some(found) = candidates.into_iter().find(|candidate| all_lists(observed, &key, vertices, |rows, n| check_edges(candidate, rows, 1, n).is_none())) else {
+            continue;
+        };
+        domains.insert(key, Spec::Edges(found));
+        // The number of edges: when it is a number of its own, its constraint now follows from the kind of list.
+        if let Expr::Var(count) = &block.count
+            && let Ok(range) = Spec::parse(&count_range(&found, vertices))
+            && matches!(domains.get(count), Some(Spec::Range { .. }))
+        {
+            domains.insert(count.clone(), range);
+        }
+    }
+}
+
+/// `l <= r`: the second of two columns is never below the first in any row of the samples, so its
+/// range starts at the first. Needs enough rows to mean something, and leaves lists of edges alone
+/// (they have their own `ordered`).
+fn infer_row_order(schema: &Schema, observed: &Observed, domains: &mut Domains) {
+    let edge_keys: BTreeSet<String> = schema.edge_blocks().iter().map(|b| b.key()).collect();
+    for names in schema.row_lines() {
+        if names.len() == 2 && domains.get(&names.join(" ")).is_some() && edge_keys.contains(&names.join(" ")) {
+            continue;
+        }
+        for pair in names.windows(2) {
+            let (first, second) = (&pair[0], &pair[1]);
+            let column = |name: &String| -> Vec<i64> {
+                observed.vars.get(name).map_or(Vec::new(), |o| o.instances.iter().map(|i| i.values[0]).collect())
+            };
+            let (a, b) = (column(first), column(second));
+            if a.len() >= 3 && a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| y >= x)
+                && let Some(Spec::Range { lo, hi, distinct, sorted }) = domains.get(second).cloned()
+                && lo != Expr::var(first)
+            {
+                domains.insert(second.clone(), Spec::Range { lo: Expr::var(first), hi, distinct, sorted });
+            }
+        }
+    }
 }
 
 // ---- putting it together -------------------------------------------------------------------------------------
@@ -969,6 +1096,11 @@ pub fn summary(schema: &Schema, domains: &Domains) -> Vec<String> {
     for variable in schema.variables() {
         if let Some(spec) = domains.get(&variable.name) {
             lines.push(format!("    {}: {spec}", variable.name));
+        }
+    }
+    for block in schema.edge_blocks() {
+        if let Some(spec) = domains.get(&block.key()) {
+            lines.push(format!("    {}: {spec}", block.key()));
         }
     }
     lines
@@ -1214,13 +1346,15 @@ mod tests {
     fn the_vertices_of_edges_are_bounded_by_the_vertex_count() {
         let d = domains_of(
             &["n m", "repeat m {", "  u v", "}"],
-            &["4 3\n1 2\n2 3\n3 4\n", "3 2\n1 2\n3 1\n"],
+            // The second sample repeats an edge, so these are not simple graphs and nothing more is assumed.
+            &["4 3\n1 2\n2 3\n3 4\n", "3 2\n1 2\n1 2\n"],
         );
         assert_eq!(d["m"], "1..size");
         // `n` bounds the vertices, so it is a size variable too.
         assert_eq!(d["n"], "1..size");
         assert_eq!(d["u"], "1..n");
-        assert_eq!(d["v"], "1..n");
+        // The second vertex is never below the first in these samples, so it starts at the first.
+        assert_eq!(d["v"], "u..n");
     }
 
     #[test]
@@ -1266,6 +1400,117 @@ mod tests {
         assert_eq!(d["t"], "1..5");
     }
 
+    // ---- trees, graphs and l <= r ----------------------------------------------------------------
+
+    fn built(sample_texts: &[&str]) -> Inferred {
+        build(&texts(sample_texts), &Hints::default()).unwrap_or_else(|e| panic!("{e}\n{sample_texts:?}"))
+    }
+
+    fn constraint(inferred: &Inferred, name: &str) -> String {
+        inferred.domains.get(name).map(|s| s.to_string()).unwrap_or_else(|| panic!("no constraint for `{name}`: {:?}", inferred.domains))
+    }
+
+    #[test]
+    fn the_edges_of_a_tree_are_counted_by_n_minus_one_and_recognised_as_a_tree() {
+        let inferred = built(&["4\n1 2\n2 3\n3 4\n", "3\n1 2\n1 3\n"]);
+        assert_eq!(inferred.schema.lines(), ["n", "repeat n-1 {", "  u v", "}"]);
+        assert_eq!(constraint(&inferred, "u v"), "tree, ordered", "every edge in the samples has the smaller vertex first");
+        assert_eq!(constraint(&inferred, "u"), "1..n");
+    }
+
+    #[test]
+    fn edges_in_any_orientation_are_a_tree_that_is_not_ordered() {
+        let inferred = built(&["4\n2 1\n2 3\n4 3\n", "3\n3 1\n2 1\n"]);
+        assert_eq!(constraint(&inferred, "u v"), "tree");
+    }
+
+    #[test]
+    fn a_tree_whose_count_is_its_own_number_has_that_number_set_to_n_minus_one() {
+        let inferred = built(&["4 3\n2 1\n2 3\n4 3\n", "5 4\n1 2\n1 3\n4 1\n5 3\n"]);
+        assert_eq!(constraint(&inferred, "u v"), "tree");
+        assert_eq!(constraint(&inferred, "m"), "n-1..n-1");
+    }
+
+    #[test]
+    fn a_forest_is_a_graph_that_need_not_be_connected() {
+        let inferred = built(&["5 3\n1 2\n2 3\n4 5\n", "4 2\n1 2\n3 4\n"]);
+        assert_eq!(constraint(&inferred, "u v"), "graph, ordered");
+        assert_eq!(constraint(&inferred, "m"), "0..n*(n-1)/2");
+    }
+
+    #[test]
+    fn a_connected_graph_is_believed_only_with_room_for_it_not_to_be_an_accident() {
+        // Four vertices, a cycle: connected, but not a tree.
+        let inferred = built(&["4 4\n1 2\n2 3\n3 4\n4 1\n", "4 5\n1 2\n2 3\n3 4\n4 1\n1 3\n"]);
+        assert_eq!(constraint(&inferred, "u v"), "graph, connected");
+        assert_eq!(constraint(&inferred, "m"), "n-1..n*(n-1)/2");
+        // Three vertices are too few to tell connected from lucky.
+        let inferred = built(&["3 2\n2 1\n3 2\n", "3 3\n1 2\n2 3\n3 1\n"]);
+        assert_eq!(constraint(&inferred, "u v"), "graph");
+    }
+
+    #[test]
+    fn an_edge_and_its_reverse_make_a_directed_graph() {
+        let inferred = built(&["3 4\n1 2\n2 1\n2 3\n3 2\n", "2 2\n1 2\n2 1\n"]);
+        assert_eq!(constraint(&inferred, "u v"), "graph, directed");
+        assert_eq!(constraint(&inferred, "m"), "0..n*(n-1)");
+    }
+
+    #[test]
+    fn a_list_that_is_not_a_simple_graph_gets_no_relation() {
+        // A loop and a repeated edge are in the samples, so nothing forbids them.
+        let inferred = built(&["5 4\n1 1\n2 3\n2 3\n1 2\n", "4 3\n1 2\n2 2\n1 2\n"]);
+        assert!(!inferred.domains.contains_key("u v"), "{:?}", inferred.domains);
+        assert_eq!(constraint(&inferred, "m"), "1..size");
+    }
+
+    #[test]
+    fn too_few_edges_to_tell_are_not_taken_for_a_graph() {
+        let inferred = built(&["3 1\n1 2\n", "2 1\n1 2\n"]);
+        assert!(!inferred.domains.contains_key("u v"), "{:?}", inferred.domains);
+    }
+
+    #[test]
+    fn the_second_of_two_columns_never_below_the_first_is_a_range_that_starts_at_the_first() {
+        // Queries `l r` with l at most r (and a loop, so it is not a simple graph).
+        let inferred = built(&["5 3\n3 1 4 1 5\n1 3\n2 5\n4 4\n", "4 2\n2 2 9 1\n1 4\n2 2\n"]);
+        assert!(!inferred.domains.contains_key("u v"), "{:?}", inferred.domains);
+        assert_eq!(constraint(&inferred, "v"), "u..n");
+        assert_eq!(constraint(&inferred, "u"), "1..n");
+    }
+
+    #[test]
+    fn the_order_is_not_assumed_when_a_row_breaks_it_or_there_are_too_few_rows() {
+        // One row goes the other way.
+        let inferred = built(&["5 3\n3 1 4 1 5\n1 3\n5 2\n4 4\n", "4 2\n2 2 9 1\n1 4\n2 2\n"]);
+        assert_eq!(constraint(&inferred, "v"), "1..n");
+        // Two rows are too few to mean anything.
+        let inferred = built(&["5 1\n3 1 4 1 5\n1 3\n", "4 1\n2 2 9 1\n2 4\n"]);
+        assert_eq!(constraint(&inferred, "v"), "1..n");
+    }
+
+    #[test]
+    fn the_summary_lists_the_constraint_of_a_list_of_edges() {
+        let inferred = built(&["4\n1 2\n2 3\n3 4\n", "3\n1 2\n1 3\n"]);
+        let text = summary(&inferred.schema, &inferred.domains).join("\n");
+        assert!(text.contains("    u v: tree, ordered"), "{text}");
+    }
+
+    #[test]
+    fn a_sample_that_is_not_what_the_constraint_says_is_warned_about() {
+        let hints = Hints { vars: BTreeMap::from([("u v".to_string(), "tree".to_string())]), ..Hints::default() };
+        // The second sample has a cycle and does not reach vertex 4.
+        let inferred = build(&texts(&["4\n1 2\n2 3\n3 4\n", "4\n1 2\n2 3\n3 1\n"]), &hints).unwrap();
+        assert!(inferred.warnings.iter().any(|w| w.contains("the edges `u v`") && w.contains("do not connect")), "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn a_constraint_for_edges_that_are_not_there_is_refused() {
+        let hints = Hints { vars: BTreeMap::from([("n a".to_string(), "tree".to_string())]), ..Hints::default() };
+        let error = build(&texts(&["3\n1 2 3\n"]), &hints).unwrap_err();
+        assert!(error.contains("is not a list of edges"), "{error}");
+    }
+
     // ---- everything together --------------------------------------------------------------------------------
 
     fn texts(list: &[&str]) -> Vec<String> {
@@ -1280,6 +1525,9 @@ mod tests {
             vec!["2\n3\n1 2 3\n2\n4 5\n"],
             vec!["2 3\n.#.\n#.#\n", "3 2\n##\n..\n#.\n"],
             vec!["4\n1 2 3 4\n", "5\n2 4 6 8 10\n"],
+            vec!["4\n1 2\n2 3\n3 4\n", "3\n1 2\n1 3\n"],
+            vec!["5 3\n1 2\n2 3\n4 5\n", "4 2\n1 2\n3 4\n"],
+            vec!["5 3\n3 1 4 1 5\n1 3\n2 5\n4 4\n", "4 2\n2 2 9 1\n1 4\n2 2\n"],
         ] {
             let inferred = build(&texts(&sample_set), &Hints::default()).unwrap();
             assert!(inferred.warnings.is_empty(), "{sample_set:?}: {:?}", inferred.warnings);
@@ -1295,6 +1543,12 @@ mod tests {
             vec!["2 3\n.#.\n#.#\n", "3 2\n##\n..\n#.\n"],
             vec!["4\n2 9 14 30\n"],
             vec!["3\n2 3 1\n", "4\n4 1 3 2\n"],
+            vec!["4\n1 2\n2 3\n3 4\n", "3\n1 2\n1 3\n"],
+            vec!["4 3\n2 1\n2 3\n4 3\n", "5 4\n1 2\n1 3\n4 1\n5 3\n"],
+            vec!["5 3\n1 2\n2 3\n4 5\n", "4 2\n1 2\n3 4\n"],
+            vec!["4 4\n1 2\n2 3\n3 4\n4 1\n", "4 5\n1 2\n2 3\n3 4\n4 1\n1 3\n"],
+            vec!["3 4\n1 2\n2 1\n2 3\n3 2\n", "2 2\n1 2\n2 1\n"],
+            vec!["5 3\n3 1 4 1 5\n1 3\n2 5\n4 4\n", "4 2\n2 2 9 1\n1 4\n2 2\n"],
         ] {
             let inferred = build(&texts(&sample_set), &Hints::default()).unwrap();
             for size in [1, 2, 5, 20] {

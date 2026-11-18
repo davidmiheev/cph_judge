@@ -55,6 +55,8 @@ pub enum Op {
     Add,
     Sub,
     Mul,
+    /// Integer division, rounding towards zero.
+    Div,
     Pow,
 }
 
@@ -115,9 +117,10 @@ impl Expr {
                     Op::Add => l.checked_add(r),
                     Op::Sub => l.checked_sub(r),
                     Op::Mul => l.checked_mul(r),
+                    Op::Div => l.checked_div(r),
                     Op::Pow => u32::try_from(r).ok().and_then(|exp| l.checked_pow(exp)),
                 };
-                value.ok_or_else(|| format!("`{self}` overflows or has a negative exponent"))
+                value.ok_or_else(|| format!("`{self}` overflows, divides by zero or has a negative exponent"))
             }
         }
     }
@@ -136,7 +139,7 @@ impl Expr {
     }
 
     fn write(&self, f: &mut fmt::Formatter<'_>, min: u8) -> fmt::Result {
-        // Precedence: + - are 1, * is 2, unary - is 3, ^ is 4, atoms are 5.
+        // Precedence: + - are 1, * / are 2, unary - is 3, ^ is 4, atoms are 5.
         match self {
             Expr::Num(n) if *n < 0 && min > 3 => write!(f, "({n})"),
             Expr::Num(n) => write!(f, "{n}"),
@@ -157,6 +160,7 @@ impl Expr {
                     Op::Add => (1, 1, 2, "+"),
                     Op::Sub => (1, 1, 2, "-"),
                     Op::Mul => (2, 2, 3, "*"),
+                    Op::Div => (2, 2, 3, "/"),
                     Op::Pow => (4, 5, 3, "^"),
                 };
                 if min > prec {
@@ -187,6 +191,7 @@ enum Tok {
     Plus,
     Minus,
     Star,
+    Slash,
     Caret,
     Open,
     Close,
@@ -200,6 +205,7 @@ impl fmt::Display for Tok {
             Tok::Plus => write!(f, "+"),
             Tok::Minus => write!(f, "-"),
             Tok::Star => write!(f, "*"),
+            Tok::Slash => write!(f, "/"),
             Tok::Caret => write!(f, "^"),
             Tok::Open => write!(f, "("),
             Tok::Close => write!(f, ")"),
@@ -225,6 +231,10 @@ fn lex(text: &str) -> Result<Vec<Tok>, String> {
             }
             '*' => {
                 tokens.push(Tok::Star);
+                i += 1;
+            }
+            '/' => {
+                tokens.push(Tok::Slash);
                 i += 1;
             }
             '^' => {
@@ -303,13 +313,17 @@ impl Parser {
         Ok(left)
     }
 
-    // term = unary ('*' unary)*
+    // term = unary (('*' | '/') unary)*
     fn term(&mut self) -> Result<Expr, String> {
         let mut left = self.unary()?;
-        while self.peek() == Some(&Tok::Star) {
+        while let Some(op) = match self.peek() {
+            Some(Tok::Star) => Some(Op::Mul),
+            Some(Tok::Slash) => Some(Op::Div),
+            _ => None,
+        } {
             self.pos += 1;
             let right = self.unary()?;
-            left = Expr::bin(Op::Mul, left, right);
+            left = Expr::bin(op, left, right);
         }
         Ok(left)
     }
@@ -433,6 +447,20 @@ pub struct Variable {
     pub visible: Vec<String>,
 }
 
+/// A list of edges in a format: how many rows, and the names of the two columns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeBlock {
+    pub columns: [String; 2],
+    pub count: Expr,
+}
+
+impl EdgeBlock {
+    /// The key of its constraint in [`Domains`]: the two names, e.g. `u v`.
+    pub fn key(&self) -> String {
+        format!("{} {}", self.columns[0], self.columns[1])
+    }
+}
+
 fn is_identifier(text: &str) -> bool {
     let mut chars = text.chars();
     chars.next().is_some_and(|c| c.is_alphabetic() || c == '_') && chars.all(|c| c.is_alphanumeric() || c == '_')
@@ -464,6 +492,42 @@ impl Schema {
         }
         let mut out = Vec::new();
         walk(&self.items, &mut Vec::new(), &mut out);
+        out
+    }
+
+    /// The `repeat` blocks that are lists of pairs: a body that is one line of two numbers.
+    pub fn edge_blocks(&self) -> Vec<EdgeBlock> {
+        fn walk(items: &[Item], out: &mut Vec<EdgeBlock>) {
+            for item in items {
+                if let Item::Repeat { count, body } = item {
+                    if let [Item::Scalars(names)] = body.as_slice()
+                        && let [u, v] = names.as_slice()
+                    {
+                        out.push(EdgeBlock { columns: [u.clone(), v.clone()], count: count.clone() });
+                    }
+                    walk(body, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.items, &mut out);
+        out
+    }
+
+    /// The rows of the `repeat` blocks that are one line of two or more numbers, as column names.
+    pub fn row_lines(&self) -> Vec<Vec<String>> {
+        fn walk(items: &[Item], out: &mut Vec<Vec<String>>) {
+            for item in items {
+                if let Item::Repeat { body, .. } = item {
+                    match body.as_slice() {
+                        [Item::Scalars(names)] if names.len() >= 2 => out.push(names.clone()),
+                        _ => walk(body, out),
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.items, &mut out);
         out
     }
 
@@ -639,6 +703,29 @@ pub enum Spec {
     Perm,
     /// A string over these characters (sorted, without repeats).
     Chars(Vec<char>),
+    /// A list of edges: the rows of a block with one line of two numbers. Keyed by the two names,
+    /// e.g. `u v`, not by one variable.
+    Edges(EdgeSpec),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// The edges of a tree: one fewer than the vertices, connecting all of them.
+    Tree,
+    /// A simple graph: no loops, no repeated edges.
+    Graph,
+}
+
+/// What a list of edges is: vertices are the numbers `lo..=hi` of the first column's constraint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EdgeSpec {
+    pub kind: EdgeKind,
+    /// An edge `u v` differs from `v u` (a graph only).
+    pub directed: bool,
+    /// All vertices are connected (always true of a tree).
+    pub connected: bool,
+    /// Every edge is written with `u < v` (not with `directed`).
+    pub ordered: bool,
 }
 
 pub type Domains = BTreeMap<String, Spec>;
@@ -652,7 +739,7 @@ impl Spec {
     pub fn vars(&self) -> BTreeSet<String> {
         match self {
             Spec::Range { lo, hi, .. } => lo.vars().union(&hi.vars()).cloned().collect(),
-            Spec::Perm | Spec::Chars(_) => BTreeSet::new(),
+            Spec::Perm | Spec::Chars(_) | Spec::Edges(_) => BTreeSet::new(),
         }
     }
 
@@ -660,6 +747,9 @@ impl Spec {
         let text = text.trim();
         if text == "perm" {
             return Ok(Spec::Perm);
+        }
+        if matches!(text.split(',').next().map(str::trim), Some("tree" | "graph")) {
+            return parse_edges(text);
         }
         if let Some(rest) = text.strip_prefix("chars")
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
@@ -687,6 +777,27 @@ impl Spec {
             sorted,
         })
     }
+}
+
+fn parse_edges(text: &str) -> Result<Spec, String> {
+    let mut parts = text.split(',').map(str::trim);
+    let kind = if parts.next() == Some("tree") { EdgeKind::Tree } else { EdgeKind::Graph };
+    let mut spec = EdgeSpec { kind, directed: false, connected: kind == EdgeKind::Tree, ordered: false };
+    for flag in parts {
+        match flag {
+            "directed" => spec.directed = true,
+            "connected" => spec.connected = true,
+            "ordered" => spec.ordered = true,
+            other => return Err(format!("unknown flag `{other}` for edges (the flags are `connected`, `directed` and `ordered`)")),
+        }
+    }
+    if spec.kind == EdgeKind::Tree && spec.directed {
+        return Err("a tree cannot be `directed`; use `graph, directed`".to_string());
+    }
+    if spec.directed && spec.ordered {
+        return Err("`directed` and `ordered` contradict each other: an ordered edge always goes from the smaller to the larger".to_string());
+    }
+    Ok(Spec::Edges(spec))
 }
 
 fn parse_alphabet(text: &str) -> Result<Spec, String> {
@@ -730,6 +841,19 @@ impl fmt::Display for Spec {
                 Ok(())
             }
             Spec::Perm => write!(f, "perm"),
+            Spec::Edges(edges) => {
+                write!(f, "{}", if edges.kind == EdgeKind::Tree { "tree" } else { "graph" })?;
+                if edges.kind == EdgeKind::Graph && edges.connected {
+                    write!(f, ", connected")?;
+                }
+                if edges.directed {
+                    write!(f, ", directed")?;
+                }
+                if edges.ordered {
+                    write!(f, ", ordered")?;
+                }
+                Ok(())
+            }
             Spec::Chars(chars) => {
                 // A dash must come first or last to be read as a character, not as a range.
                 let mut text = String::new();
@@ -766,10 +890,25 @@ pub fn validate_domains(schema: &Schema, domains: &Domains) -> Result<(), String
         let spec = domains.get(&variable.name).ok_or_else(|| format!("`{}` has no constraint", variable.name))?;
         validate_spec(variable, spec)?;
     }
+    let blocks: HashSet<String> = schema.edge_blocks().iter().map(EdgeBlock::key).collect();
     let known: HashSet<&str> = variables.iter().map(|v| v.name.as_str()).collect();
-    if let Some(unknown) = domains.keys().find(|name| !known.contains(name.as_str())) {
-        let names: Vec<&str> = variables.iter().map(|v| v.name.as_str()).collect();
-        return Err(format!("`{unknown}` is not a variable of the input format (the variables are: {})", names.join(", ")));
+    for (key, spec) in domains {
+        if key.contains(' ') {
+            // The constraint of a list of edges, keyed by its two columns.
+            if !blocks.contains(key) {
+                let lists: Vec<String> = blocks.iter().cloned().collect();
+                return Err(format!(
+                    "`{key}` is not a list of edges in the input format (a repeated block holding one line of two numbers){}",
+                    if lists.is_empty() { String::new() } else { format!("; the lists are: {}", lists.join(", ")) }
+                ));
+            }
+            if !matches!(spec, Spec::Edges(_)) {
+                return Err(format!("`{key}` is a list of edges; its constraint is `tree` or `graph` (with flags), not `{spec}`"));
+            }
+        } else if !known.contains(key.as_str()) {
+            let names: Vec<&str> = variables.iter().map(|v| v.name.as_str()).collect();
+            return Err(format!("`{key}` is not a variable of the input format (the variables are: {})", names.join(", ")));
+        }
     }
     Ok(())
 }
@@ -778,6 +917,11 @@ pub fn validate_domains(schema: &Schema, domains: &Domains) -> Result<(), String
 pub fn validate_spec(variable: &Variable, spec: &Spec) -> Result<(), String> {
     let name = &variable.name;
     match (variable.kind, spec) {
+        (_, Spec::Edges(_)) => {
+            return Err(format!(
+                "`{name}` is one variable; `tree` and `graph` are constraints of a pair of columns that list edges, written with both names, e.g. `u v`"
+            ));
+        }
         (VarKind::Scalar, Spec::Range { distinct: false, sorted: false, .. }) => {}
         (VarKind::Scalar, Spec::Range { .. }) => {
             return Err(format!("`{name}` is a single number: `distinct` and `sorted` are for arrays"));
@@ -822,6 +966,20 @@ mod tests {
     }
 
     #[test]
+    fn division_rounds_towards_zero_and_has_the_precedence_of_multiplication() {
+        assert_eq!(eval("7/2", &[]), Ok(3));
+        assert_eq!(eval("-7/2", &[]), Ok(-3));
+        assert_eq!(eval("n*(n-1)/2", &[("n", 5)]), Ok(10), "the number of pairs of 5 things");
+        assert_eq!(eval("12/2/3", &[]), Ok(2), "left-associative");
+        assert_eq!(eval("2+6/3", &[]), Ok(4));
+        assert!(eval("1/0", &[]).unwrap_err().contains("divides by zero"));
+        for text in ["n*(n-1)/2", "n/(m/2)", "n/m/2", "(n+1)/2"] {
+            let expr = parse(text);
+            assert_eq!(Expr::parse(&expr.to_string()), Ok(expr.clone()), "{text}");
+        }
+    }
+
+    #[test]
     fn expressions_use_variables_and_the_usual_competitive_notations() {
         assert_eq!(eval("n-1", &[("n", 5)]), Ok(4));
         assert_eq!(eval("2*n+m", &[("n", 5), ("m", 3)]), Ok(13));
@@ -847,7 +1005,7 @@ mod tests {
         assert!(Expr::parse("(1+2").unwrap_err().contains("not closed"));
         assert!(Expr::parse("1 2").unwrap_err().contains("unexpected `2`"));
         assert!(Expr::parse("2n").unwrap_err().contains("2*n"));
-        assert!(Expr::parse("1/2").unwrap_err().contains("unexpected character `/`"));
+        assert!(Expr::parse("1%2").unwrap_err().contains("unexpected character `%`"));
         assert!(Expr::parse("99999999999999999999").unwrap_err().contains("too large"));
     }
 
@@ -990,6 +1148,42 @@ mod tests {
         // Printed with the dash first, so that it is not read as a range again.
         let spec = Spec::Chars(vec!['*', '-', '0']);
         assert_eq!(Spec::parse(&spec.to_string()), Ok(spec));
+    }
+
+    #[test]
+    fn a_list_of_edges_has_a_constraint_that_prints_and_parses_back() {
+        for text in ["tree", "tree, ordered", "graph", "graph, connected", "graph, directed", "graph, ordered", "graph, connected, ordered", "graph, connected, directed"] {
+            let parsed = spec(text);
+            assert_eq!(Spec::parse(&parsed.to_string()), Ok(parsed.clone()), "{text} -> {parsed}");
+        }
+        assert_eq!(spec("tree, connected").to_string(), "tree", "a tree is always connected");
+        assert_eq!(spec("graph,ordered,connected").to_string(), "graph, connected, ordered");
+        let error = |text: &str| Spec::parse(text).unwrap_err();
+        assert!(error("tree, directed").contains("cannot be `directed`"));
+        assert!(error("graph, directed, ordered").contains("contradict"));
+        assert!(error("graph, dense").contains("unknown flag `dense`"));
+    }
+
+    #[test]
+    fn the_lists_of_edges_in_a_format_are_the_repeats_of_one_line_of_two_numbers() {
+        let s = schema("n m\nrepeat m {\n u v\n}\nrepeat n {\n a b c\n}\nt\nrepeat t {\n k\n x y\n}");
+        let keys: Vec<String> = s.edge_blocks().iter().map(EdgeBlock::key).collect();
+        assert_eq!(keys, ["u v"]);
+        assert_eq!(s.row_lines(), [vec!["u", "v"], vec!["a", "b", "c"]], "the body of the last repeat has two lines, so it is not rows");
+    }
+
+    #[test]
+    fn a_constraint_on_a_list_of_edges_is_checked_against_the_format() {
+        let s = schema("n m\nrepeat m {\n u v\n}\na[n]");
+        let base: Vec<(&str, &str)> = vec![("n", "1..size"), ("m", "0..n*(n-1)/2"), ("u", "1..n"), ("v", "1..n"), ("a", "1..9")];
+        let with = |extra: &[(&str, &str)]| {
+            let domains: Domains = base.iter().chain(extra).map(|(n, t)| (n.to_string(), spec(t))).collect();
+            validate_domains(&s, &domains)
+        };
+        assert_eq!(with(&[("u v", "graph")]), Ok(()));
+        assert!(with(&[("n m", "graph")]).unwrap_err().contains("`n m` is not a list of edges"));
+        assert!(with(&[("u v", "1..5")]).unwrap_err().contains("its constraint is `tree` or `graph`"));
+        assert!(with(&[("a", "tree")]).unwrap_err().contains("is one variable"));
     }
 
     #[test]
