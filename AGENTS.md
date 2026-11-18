@@ -27,9 +27,13 @@ cph_judge/
 ├── Cargo.toml          # Rust project config
 ├── Cargo.lock          # Dependency lock file
 ├── src/
-│   └── main.rs         # Main judge logic, test runner, output comparator
+│   ├── main.rs         # CLI, problem discovery, orchestration, result printing
+│   ├── compile.rs      # Package name lookup and `cargo build --release`
+│   ├── runner.rs       # run_once (process + pipes + wait4) and RunReport::check (verdicts)
+│   └── compare.rs      # Tokenized, float-aware output comparator
 ├── docs/
 │   ├── arch.md         # System architecture and pipeline
+│   ├── design-stress-interactive.md  # Plan: _checker, interactive, stress testing
 │   ├── todo.md         # Project roadmap and backlog
 │   └── analysis.md     # Code analysis
 ├── .gitignore          # Ignores /target and artifacts
@@ -58,9 +62,11 @@ The judge expects JSON config files with `.prob` extension (from Competitive Com
 
 - **AC (Accepted)**: Output matches expected (tokenized comparison with $\epsilon = 10^{-6}$ for floating-point values).
 - **WA (Wrong Answer)**: Output mismatches expected tokens.
-- **TLE (Time Limit Exceeded)**: Process killed via `tokio::time::timeout` and process tree termination (`pkill -9 -P`, `kill -9`).
+- **TLE (Time Limit Exceeded)**: User + system CPU time (from `wait4` `rusage`) above `timeLimit`. Processes still running after the wall-clock cap (`2 × timeLimit + 500 ms`, via `tokio::time::timeout`) are killed by process tree termination (`pkill -9 -P`, `kill -9`).
 - **MLE (Memory Limit Exceeded)**: Checked via `wait4::Wait4` `rusage.maxrss` against configured `memoryLimit`.
 - **RE (Runtime Error)**: Checked when process exits with non-zero status or termination signal.
+- Checks run in the order TLE, RE, MLE, then output comparison.
+- **Exit codes**: `0` all tests passed, `1` compile failure or any non-AC test, `2` usage / judge error.
 
 ## Dependencies
 
@@ -79,3 +85,4 @@ The judge expects JSON config files with `.prob` extension (from Competitive Com
 - Architecture: [`docs/arch.md`](docs/arch.md)
 - Roadmap: [`docs/todo.md`](docs/todo.md)
 - Analysis: [`docs/analysis.md`](docs/analysis.md)
+- Checker / interactive / stress plan: [`docs/design-stress-interactive.md`](docs/design-stress-interactive.md)

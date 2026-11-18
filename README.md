@@ -7,9 +7,9 @@ A fast, concurrent competitive programming judge written in Rust, designed to wo
 ## Features
 
 - **Automatic Problem Discovery**: Recursively finds `.prob` configuration files matching problem names using `ignore::WalkBuilder`.
-- **Parallel Test Execution**: Runs test cases concurrently with `tokio` async workers.
+- **Parallel Test Execution**: Runs test cases concurrently with `tokio` async workers (at most one per CPU core).
 - **Resource Limit Enforcement**:
-  - **Time Limits (TLE)**: Configurable per-problem timeout with process-tree cleanup.
+  - **Time Limits (TLE)**: Judged on CPU time, with a wall-clock cap and process-tree cleanup for hung processes.
   - **Memory Limits (MLE)**: Peak resident set size tracking using `wait4` / `rusage`.
   - **Runtime Errors (RE)**: Robust exit code and signal failure detection.
 - **Tokenized & Float-Aware Comparison**: Token-by-token comparison with automatic floating-point epsilon tolerance ($\epsilon = 10^{-6}$) and whitespace insensitivity.
@@ -47,6 +47,10 @@ cargo run --release -- ~/cp/problemset 1840A
 
 ---
 
+The process exit code is `0` when every test passes, `1` when compilation fails or a test does not pass, and `2` on a usage error or when the judge itself cannot run.
+
+---
+
 ## Verdicts
 
 | Icon | Verdict | Description |
@@ -62,6 +66,7 @@ cargo run --release -- ~/cp/problemset 1840A
 ## Documentation
 
 - **[Architecture](docs/arch.md)**: Detailed system design, execution pipeline, and comparison engine.
+- **[Checker, Interactive & Stress Design](docs/design-stress-interactive.md)**: Plan for `_checker`, interactive problems, and stress testing.
 - **[Roadmap & Backlog](docs/todo.md)**: Current development state and upcoming features.
 - **[Code Analysis](docs/analysis.md)**: Breakdown of components and evolution.
 

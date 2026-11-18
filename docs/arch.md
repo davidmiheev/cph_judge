@@ -15,9 +15,10 @@ flowchart TD
     C --> D["Prepare Solution (Copy source to src/main.rs)"]
     D --> E["Build Binary (cargo build --release)"]
     E -- Failure --> F["Output Compiler Log & Exit"]
-    E -- Success --> G["Spawn Tokio Async Test Tasks"]
-    G --> H["Worker: wait4 child process + Tokio timeout"]
-    H --> I["Collect Verdicts (AC, WA, TLE, MLE, RE)"]
+    E -- Success --> G["Spawn Tokio Async Test Tasks (at most one running per core)"]
+    G --> H["run_once: stdin writer thread + stdout/stderr readers + wait4, wall-clock cap"]
+    H --> H2["RunReport::check: CPU-time TLE, RE, MLE"]
+    H2 --> I["Collect Verdicts (AC, WA, TLE, MLE, RE)"]
     I --> J["Tokenized / Float-Aware Output Comparison"]
     J --> K["Colored Test Results, RE Traces & Final Score"]
 ```
@@ -40,28 +41,58 @@ flowchart TD
   - `srcPath`: Path to the source file.
   - `tests`: Array of input/output test case pairs.
 
-### 3. Solution Compilation
+### 3. Solution Compilation (`compile.rs`)
 - Copies the solution file to the target crate's `src/main.rs`.
-- Reads `Cargo.toml` to extract package/binary name.
-- Executes `cargo build --release`, redirecting stderr to `compiler_log.txt`.
+- Reads `Cargo.toml` to extract package/binary name (`package_name`).
+- Executes `cargo build --release` (`build_release`), redirecting stderr to `compiler_log.txt`.
 - Halts execution and prints logs if compilation fails.
 
-### 4. Concurrent Execution Engine (`run_with_timeout`)
-- Evaluates test cases in parallel using `tokio::spawn` and `tokio::task::spawn_blocking`.
-- Spawns independent reader threads for `stdout` and `stderr` to prevent pipe deadlocks.
-- Uses `wait4::Wait4` to retrieve process status and resource usage metrics (`rusage.maxrss`).
-- Enforces time limits using `tokio::time::timeout`.
-- Terminates processes that exceed limits using process-tree signal dispatching (`pkill -9 -P` and `kill -9`).
+### 4. Concurrent Execution Engine (`runner.rs`)
+- `run_once` runs one process and returns a raw `RunReport` (exit status, stdout, stderr,
+  CPU time, peak RSS). `RunReport::check` then applies `Limits` and yields a verdict. The two
+  steps are separate so later features (checker, brute force, interactor) can reuse the raw run.
+- Test cases run as `tokio::spawn` tasks around `tokio::task::spawn_blocking`, with a semaphore so
+  **at most one test runs per core** (`available_parallelism`).
+- `stdin` is written from its own thread, and `stdout`/`stderr` are drained by two more, so a
+  program that streams output while still reading input cannot deadlock the judge.
+- `wait4::Wait4` returns the exit status and resource usage: user + system **CPU time** and
+  `rusage.maxrss`.
+- The time limit is enforced on **CPU time**. A hard **wall-clock cap** of `2 × timeLimit + 500 ms`
+  (`tokio::time::timeout`) kills processes that are blocked or sleeping and so never accumulate CPU
+  time. Trade-off: an infinite loop is reported after the wall cap, not at the time limit.
+- Processes past the wall cap are terminated with process-tree signal dispatching (`pkill -9 -P`
+  and `kill -9`).
 
 ### 5. Verdict Evaluation
 
+Checked in this order: TLE, RE, MLE, then output comparison.
+
 | Verdict | Trigger Condition | Display |
 |---|---|---|
-| **AC** (Accepted) | Program exited successfully, output matches expected within tolerance | `✅ Test #N (duration, memory)` |
+| **AC** (Accepted) | Program exited successfully, output matches expected within tolerance | `✅ Test #N (CPU time, memory)` |
 | **WA** (Wrong Answer) | Program exited successfully, output differs from expected | `❌ Test #N` (Shows expected vs received) |
-| **TLE** (Time Limit Exceeded) | Execution exceeded `timeLimit` | `⏱️ Test #N TLE (limit)` |
+| **TLE** (Time Limit Exceeded) | CPU time exceeded `timeLimit`, or the wall-clock cap was hit | `⏱️ Test #N TLE (limit)` |
 | **MLE** (Memory Limit Exceeded) | Peak RSS exceeded `memoryLimit` | `💾 Test #N MLE (limit)` |
 | **RE** (Runtime Error) | Non-zero exit code, signal termination, or panic | `💥 Test #N RE (status)` with crash / panic trace |
+
+### 6. Exit Codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Every test passed |
+| 1 | Compilation failed, or at least one test did not pass |
+| 2 | Usage error, or the judge itself could not run (e.g. `.prob` not found) |
+
+### 7. Source Layout
+
+| File | Contents |
+|---|---|
+| `src/main.rs` | CLI, problem discovery, orchestration, result printing |
+| `src/compile.rs` | `package_name`, `build_release` |
+| `src/runner.rs` | `run_once`, `RunReport::check`, `Limits`, `RunError` |
+| `src/compare.rs` | `compare_outputs` |
+
+Planned checker, interactive and stress features: see [`design-stress-interactive.md`](design-stress-interactive.md).
 
 ---
 

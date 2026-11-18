@@ -1,15 +1,23 @@
-use colored::*; // 1. Import the trait
+mod compare;
+mod compile;
+mod runner;
+
+use colored::*;
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use std::{
-    env, fs, 
-    io::{Read, Write},
-    path::{Path, PathBuf}, 
-    process::{Command, Output, Stdio},
-    time::{Duration, Instant}, 
+    env, fs,
+    os::unix::process::ExitStatusExt,
+    path::PathBuf,
+    process::ExitCode,
+    sync::Arc,
+    time::Duration,
 };
-use tokio::time::timeout;
-use wait4::Wait4;
+use tokio::sync::Semaphore;
+
+use compare::compare_outputs;
+use compile::BuildOutcome;
+use runner::{run_once, Limits, RunError};
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -26,55 +34,9 @@ struct CphConfig {
 }
 
 #[derive(Deserialize)]
-struct Test { input: String, output: String }
-
-#[derive(Deserialize)]
-struct CargoToml { package: Package }
-#[derive(Deserialize)]
-struct Package { name: String }
-
-/// Compares actual output against expected output token by token.
-/// Floating-point numbers are compared with relative and absolute epsilon tolerance (1e-6).
-pub fn compare_outputs(actual: &str, expected: &str) -> bool {
-    let actual_tokens: Vec<&str> = actual.split_whitespace().collect();
-    let expected_tokens: Vec<&str> = expected.split_whitespace().collect();
-
-    if actual_tokens.len() != expected_tokens.len() {
-        return false;
-    }
-
-    const EPS: f64 = 1e-6;
-
-    for (a, e) in actual_tokens.iter().zip(expected_tokens.iter()) {
-        if a == e {
-            continue;
-        }
-
-        match (a.parse::<f64>(), e.parse::<f64>()) {
-            (Ok(a_num), Ok(e_num)) if a_num.is_finite() && e_num.is_finite() => {
-                let diff = (a_num - e_num).abs();
-                if diff > EPS && diff > EPS * e_num.abs() {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-
-    true
-}
-
-use std::os::unix::process::ExitStatusExt;
-
-#[derive(Debug)]
-pub enum RunError {
-    Tle,
-    Mle,
-    Re {
-        status: std::process::ExitStatus,
-        stderr: String,
-    },
-    System(String),
+struct Test {
+    input: String,
+    output: String,
 }
 
 fn format_exit_status(status: std::process::ExitStatus) -> String {
@@ -92,92 +54,6 @@ fn format_exit_status(status: std::process::ExitStatus) -> String {
     }
 }
 
-async fn run_with_timeout(
-    bin_path: &Path,
-    project_root: &Path,
-    input: &str,
-    timeout_duration: Duration,
-    memory_limit_bytes: u64,
-) -> Result<(std::process::Output, u64), RunError> {
-    let mut child = Command::new(bin_path)
-        .current_dir(project_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| RunError::System(e.to_string()))?;
-
-    let pid = child.id();
-    let input_owned = input.as_bytes().to_vec();
-
-    let run_task = tokio::task::spawn_blocking(move || -> Result<(Output, u64), RunError> {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(&input_owned);
-        }
-
-        let mut stdout_pipe = child.stdout.take().ok_or_else(|| RunError::System("Failed to capture stdout".into()))?;
-        let read_stdout = std::thread::spawn(move || {
-            let mut stdout = Vec::new();
-            let _ = stdout_pipe.read_to_end(&mut stdout);
-            stdout
-        });
-
-        let mut stderr_pipe = child.stderr.take().ok_or_else(|| RunError::System("Failed to capture stderr".into()))?;
-        let read_stderr = std::thread::spawn(move || {
-            let mut stderr = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut stderr);
-            stderr
-        });
-
-        let res_use = child.wait4().map_err(|e| RunError::System(e.to_string()))?;
-        let stdout = read_stdout.join().unwrap_or_default();
-        let stderr_bytes = read_stderr.join().unwrap_or_default();
-        let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
-
-        if !res_use.status.success() {
-            return Err(RunError::Re {
-                status: res_use.status,
-                stderr,
-            });
-        }
-
-        let output = Output {
-            status: res_use.status,
-            stdout,
-            stderr: stderr_bytes,
-        };
-
-        Ok((output, res_use.rusage.maxrss))
-    });
-
-    match timeout(timeout_duration, run_task).await {
-        Ok(Ok(Ok((output, max_mem)))) => {
-            if max_mem > memory_limit_bytes {
-                return Err(RunError::Mle);
-            }
-            Ok((output, max_mem))
-        }
-        Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(join_err)) => Err(RunError::System(join_err.to_string())),
-        Err(_) => {
-            kill_process_tree(pid);
-            Err(RunError::Tle)
-        }
-    }
-}
-
-fn kill_process_tree(pid: u32) {
-    let _ = Command::new("pkill")
-        .arg("-9")
-        .arg("-P")
-        .arg(pid.to_string())
-        .output();
-    let _ = Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .output();
-}
-
 fn find_prob_file(search_root: &str, target: &str) -> Option<PathBuf> {
     println!("{} {} in {}...", "🔍 Searching for".yellow(), target.bold().cyan(), search_root);
     WalkBuilder::new(search_root)
@@ -191,74 +67,86 @@ fn find_prob_file(search_root: &str, target: &str) -> Option<PathBuf> {
         .map(|e| e.into_path())
 }
 
+/// Exit codes: 0 = every test passed, 1 = compilation failed or a test failed,
+/// 2 = usage error or the judge itself could not run.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{} {}", "error:".red().bold(), e);
+            ExitCode::from(2)
+        }
+    }
+}
+
+async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: judge <search_dir> <problem_name>");
-        std::process::exit(1);
+        return Ok(ExitCode::from(2));
     }
 
-    let prob_path = find_prob_file(&args[1], &args[2])
-        .ok_or("Metadata file not found.")?;
-    
+    let prob_path = find_prob_file(&args[1], &args[2]).ok_or("Metadata file not found.")?;
+
     let config: CphConfig = serde_json::from_str(&fs::read_to_string(&prob_path)?)?;
     let project_root = prob_path.parent().and_then(|p| p.parent()).ok_or("Root not found")?;
-    
+
     fs::copy(&config.src_path, project_root.join("src/main.rs"))?;
 
-    let cargo_contents = fs::read_to_string(project_root.join("Cargo.toml"))?;
-    let cargo_toml: CargoToml = toml::from_str(&cargo_contents)?;
-    let bin_name = cargo_toml.package.name;
+    let bin_name = compile::package_name(project_root)?;
 
     println!("🔨 Compiling {} ({})", bin_name.bold(), "release".yellow());
-    let log_file = fs::File::create(project_root.join("compiler_log.txt"))?;
-    
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(project_root)
-        .stderr(log_file)
-        .status()?;
-
-    if !status.success() {
+    if let BuildOutcome::Failed { log } = compile::build_release(project_root)? {
         eprintln!("{}", "❌ Compilation failed!".red().bold());
-        let log_content = fs::read_to_string(project_root.join("compiler_log.txt"))?;
-        println!("{}", log_content);
-        return Ok(());
+        println!("{}", log);
+        return Ok(ExitCode::from(1));
     }
 
     let bin_path = project_root.join("target/release").join(&bin_name);
-    let mut passed_count = 0;
     let total_tests = config.tests.len();
 
-    let mut handles = Vec::new();
     let default_timeout = Duration::from_secs(3);
-    let time_limit = config.time_limit.map(Duration::from_millis).unwrap_or(default_timeout);
-    let memory_limit_bytes = config.memory_limit.unwrap_or(256) * 1024 * 1024; // MB to Bytes
+    let limits = Limits {
+        time: config.time_limit.map(Duration::from_millis).unwrap_or(default_timeout),
+        memory_bytes: config.memory_limit.unwrap_or(256) * 1024 * 1024, // MB to Bytes
+    };
 
+    // Time limits are measured in CPU time, but running far more processes than
+    // cores still slows each of them down (cache, memory bandwidth, scheduling),
+    // so at most one test per core runs at a time.
+    let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let permits = Arc::new(Semaphore::new(parallelism));
+
+    let mut handles = Vec::new();
     for (i, test) in config.tests.into_iter().enumerate() {
         let bin_path = bin_path.clone();
         let project_root = project_root.to_path_buf();
-        
+        let permits = Arc::clone(&permits);
+
         handles.push(tokio::spawn(async move {
-            let start = Instant::now();
-            let output_result = run_with_timeout(&bin_path, &project_root, &test.input, time_limit, memory_limit_bytes).await;
-            (i, test, start.elapsed(), output_result)
+            let _permit = permits.acquire_owned().await.expect("semaphore is never closed");
+            let result = match run_once(&bin_path, [] as [&str; 0], &project_root, test.input.as_bytes(), limits.wall_cap()).await {
+                Ok(report) => report.check(&limits),
+                Err(e) => Err(e),
+            };
+            (i, test, result)
         }));
     }
 
+    let mut passed_count = 0;
     for handle in handles {
-        let (i, test, duration, output_result) = handle.await.expect("Failed to join task");
-        
+        let (i, test, result) = handle.await.expect("Failed to join task");
+
         let test_label = format!("Test #{}", i + 1);
-        
-        match output_result {
+
+        match result {
             Err(RunError::Tle) => {
-                let limit_label = format!("{:.2}s", time_limit.as_secs_f32());
+                let limit_label = format!("{:.2}s", limits.time.as_secs_f32());
                 println!("{}  {} ({})", "⏱️".yellow(), format!("{} TLE", test_label).yellow(), limit_label);
             }
             Err(RunError::Mle) => {
-                let limit_label = format!("{} MB", memory_limit_bytes / 1024 / 1024);
+                let limit_label = format!("{} MB", limits.memory_bytes / 1024 / 1024);
                 println!("{}  {} ({})", "💾".yellow(), format!("{} MLE", test_label).yellow(), limit_label);
             }
             Err(RunError::Re { status, stderr }) => {
@@ -274,13 +162,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(RunError::System(e)) => {
                 println!("{}  {} ({})", "⚠️".red(), format!("{} Error", test_label).red(), e);
             }
-            Ok((output, max_mem)) => {
-                let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(output) => {
+                let actual = output.stdout.trim().to_string();
                 let expected = test.output.trim().to_string();
-                let mem_mb = max_mem as f64 / 1048576.0;
+                let mem_mb = output.max_rss as f64 / 1048576.0;
 
                 if compare_outputs(&actual, &expected) {
-                    println!("{} {} ({:?}, {:.2} MB)", "✅".green(), test_label.green(), duration, mem_mb);
+                    println!("{} {} ({:.2?}, {:.2} MB)", "✅".green(), test_label.green(), output.cpu_time, mem_mb);
                     passed_count += 1;
                 } else {
                     println!("{} {}", "❌".red(), test_label.red().bold());
@@ -297,58 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let final_text = format!("\nFinal Score: {}/{}", passed_count, total_tests);
     if passed_count == total_tests {
         println!("{}", final_text.green().bold());
+        Ok(ExitCode::SUCCESS)
     } else {
         println!("{}", final_text.yellow().bold());
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_exact_match() {
-        assert!(compare_outputs("hello world", "hello world"));
-        assert!(compare_outputs("42 100", "42 100"));
-        assert!(!compare_outputs("hello world", "hello there"));
-    }
-
-    #[test]
-    fn test_whitespace_insensitivity() {
-        assert!(compare_outputs("1  2 \n 3", "1 2 3\n"));
-        assert!(compare_outputs("  a   b  ", "a b"));
-    }
-
-    #[test]
-    fn test_float_comparison() {
-        // Equal numbers with different precision formatting
-        assert!(compare_outputs("3.141590", "3.14159"));
-        assert!(compare_outputs("1.0", "1"));
-        assert!(compare_outputs("0.500000", "0.5"));
-
-        // Within 1e-6 epsilon
-        assert!(compare_outputs("3.14159265", "3.14159270"));
-
-        // Large numbers with relative error within 1e-6
-        assert!(compare_outputs("1000000.5", "1000000.0"));
-
-        // Exceeding 1e-6 epsilon
-        assert!(!compare_outputs("3.14159", "3.14160"));
-        assert!(!compare_outputs("1.0", "1.0001"));
-    }
-
-    #[test]
-    fn test_mixed_tokens() {
-        assert!(compare_outputs("Case #1: 3.14159265 42", "Case #1: 3.14159270 42"));
-        assert!(!compare_outputs("Case #1: 3.14159265 42", "Case #2: 3.14159265 42"));
-    }
-
-    #[test]
-    fn test_token_length_mismatch() {
-        assert!(!compare_outputs("1 2 3", "1 2"));
-        assert!(!compare_outputs("1 2", "1 2 3"));
+        Ok(ExitCode::from(1))
     }
 }
-
