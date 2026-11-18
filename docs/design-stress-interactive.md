@@ -1,6 +1,6 @@
 # Design: checker, interactive problems, and stress testing
 
-Status: **phases 0-3 done** (runner, CPU-time limits, `_checker`, interactive problems, stress testing with a hand-written generator); the inferred generator (phases 4-5) is planned. See [Phases](#phases).
+Status: **phases 0-4 done** (runner, CPU-time limits, `_checker`, interactive problems, stress testing with a hand-written or an inferred generator, `--ask-constraints`); only schema-aware shrinking (phase 5) is planned. See [Phases](#phases).
 
 All three features are the same machine with different inputs and a different
 oracle (the thing that decides pass/fail):
@@ -142,8 +142,8 @@ flows between the processes directly). Driving an interactive run from the gener
 
 ## Stress (`--stress`)
 
-`cph_judge <dir> <name> --stress [--iters N] [--seed S] [--max-size N] [--save]`; the existing
-positional form is unchanged.
+`cph_judge <dir> <name> --stress [--iters N] [--seed S] [--max-size N] [--save] [--ask-constraints]
+[--show-schema]`; the existing positional form is unchanged.
 
 1. Generate `(seed, size)`, with `size` ramping up over the iterations.
 2. Run brute force, then the solution.
@@ -201,50 +201,115 @@ Implemented in phase 3 (`src/stress.rs`, `src/cli.rs`, `src/hints.rs`):
 
 Two tiers:
 
-1. **`A_gen.rs`** if present: `A_gen <seed> <size>` prints one test to stdout. The escape hatch for
-   graphs, queries, and "an answer exists" guarantees.
-2. **Built-in, inferred** from the `.prob` samples plus hints.
+1. **`A_gen.rs`** if present (or named by the `gen` hint): `A_gen <seed> <size>` prints one test to
+   stdout. The escape hatch for graphs, trees, queries, and "an answer exists" guarantees.
+2. **Built-in, inferred** from the `.prob` samples plus hints (phase 4). Used when there is no generator
+   file; it runs inside the judge, with no process per test.
 
-Inference (all hypotheses must hold in *every* sample):
+### The format language (`src/schema.rs`)
 
-- Tokenize each sample into lines × tokens, typed int / float / word.
-- Header integers on short leading lines are candidate parameters (`n`, `m`, `t`).
-- A later line group is tied to a parameter when its token count (or line count) equals `n`, `n-1`,
-  etc. A repeated block counted by a leading integer is a multitest.
-- Observed per-column facts: string alphabet, permutation, distinct, sorted.
+Inference, the `format` hint and `--show-schema` all use one small text language, so what is printed
+can be pasted back and edited:
 
-Rules that keep it safe:
+```text
+t                    a line of integers, each named
+repeat t {           the lines inside are repeated `t` times
+  n m
+  a[n]               one line of n integers
+  str s[m]           one line holding a string of m characters
+  repeat m {         m lines ...
+    u v              ... each with two integers
+  }
+}
+```
 
-- Infer **conservatively**: an over-tight schema only costs coverage; a too-loose one produces
-  invalid inputs and false counterexamples.
-- Print the inferred schema on every run (`--show-schema` prints it in hint syntax so it can be
-  copied and edited).
-- Every sample must round-trip through the schema before the run starts.
-- With 1–3 samples ambiguity is common; hints resolve it.
+A grid is `repeat n { str s[m] }`, a matrix `repeat n { a[m] }`, a list of edges `repeat m { u v }`, and a
+multitest `t` followed by `repeat t { ... }`: everything is one of four items (a line of numbers, an array,
+a string, a repeated block). Lengths and counts are expressions over earlier numbers and `size`
+(`n`, `n-1`, `2*n`, `10^5`, `1e5`). Names are unique across the whole format, so a constraint can name a
+variable without ambiguity.
 
-What cannot be inferred: value ranges from the statement (`a ≤ 1e9`), global constraints
-(`sum n ≤ 2e5`), connectivity/other guarantees. CPH provides no constraint text.
+Each variable has one constraint, in the syntax of the `vars` hint and of the `--ask-constraints` prompt:
+`lo..hi` (bounds are expressions), `lo..hi, distinct`, `lo..hi, sorted`, `perm`, `chars a-z`.
 
-"Adaptive" behaviour: ramp the size over the run, keep default value ranges small (collisions find
-bugs), and mix in boundary values from the hints.
+### How the format is inferred (`src/infer.rs`)
+
+All samples are read at once, line by line. Each line is read as the first possibility that fits **every**
+sample: an array whose length is an earlier number (or one less), a block of rows counted by an earlier
+number that nothing has used yet, a string, or a line of new numbers. When a choice leads to a dead end
+later, the search goes back and tries the next one (a matrix needs this once the samples have different
+row counts). A multitest (first number `t`, then `t` blocks) is tried too; when both readings fit, the one
+that leaves fewer numbers unused, then fewer guessed lengths, then fewer lines, wins.
+
+Defaults for the constraints stay inside what the samples show:
+
+- A value that never exceeds some earlier number in any sample is bounded by it (`a: 1..n`): an index into
+  a list of n things must not exceed n, and that number is then a size variable too. The vertices of an edge
+  list are bounded by the vertex count this way.
+- Other values get the range they were seen in, widened to start at 1 (or 0, or at -10 when negatives
+  occur) and to reach at least 10.
+- Lengths and counts default to `1..size`; the number of tests `t` to `1..5`.
+- Properties shared by every sample are kept if they were shown by enough elements: `perm` for three or
+  more, `distinct` and `sorted` for four or more.
+- Strings use the characters that were seen.
+
+### Staying safe
+
+- **Refuse instead of guessing.** Non-integer numbers, blank lines inside the input, lines mixing numbers
+  and words, several words on one line, and samples that do not follow one format are all rejected, with
+  the line and a pointer to writing `A_gen.rs`.
+- **Say what was guessed.** The format and constraints are printed on every run, with a note for each
+  ambiguity that was resolved (`its length could be n or m; chose n`; `these lines could also be rows`;
+  `could also be a multitest`), a warning for every place a sample breaks the final constraints, and a
+  reminder that the constraints are guesses.
+- **Offsets are limited.** Only `n` and `n-1` are tried as lengths. `n+1` was tried at first and removed:
+  with small samples it explains nearly anything, which made a multitest input parse as five unrelated arrays.
+- **Constraints that cannot be met** (`8` different values from `1..3`) are a setup problem, never a
+  counterexample, and the message points at `--ask-constraints`.
+- Samples cannot show what the problem *allows*, only what *occurs*. Trees, simple graphs, connectivity,
+  `l <= r`, "an answer exists" and `sum of n <= ...` cannot be expressed; use `A_gen.rs` for those.
+
+### Size
+
+The size of a test works through **size variables**: a variable that sets a length or count, or that another
+variable's constraint uses as a bound. While generating a test of size `s` such a variable is limited to the
+first `s` values of its range (counting from at least 1), so `n: 1..8` still gives small tests first and `t`
+grows with the size too. Other values do not depend on the size. An empty array leaves no line at all.
+
+### `--ask-constraints` and `--show-schema`
+
+`--ask-constraints` (with `--stress`, for the inferred generator) shows the inferred format, then asks about each
+variable in turn: the prompt shows the current constraint, Enter keeps it, `?` explains the syntax and what
+the constraint may use, and a wrong answer is explained and asked again. If anything changed, the
+constraints are shown again with any samples they contradict, and the judge offers to save the format and the
+constraints in `<solution>.stress.json`, so later runs use them without typing (the format is saved only if it
+was inferred, not if it came from a hint). A closed input keeps what is left unchanged, so the flag never
+hangs a script. It is an error when a generator file is in use.
+
+`--show-schema` prints the format and constraints as a hints object ready to paste, and stops without
+compiling or running anything.
 
 ### Hints
 
 An optional `"stress"` object in the `.prob`, or the same object in a sidecar `A.stress.json` next to
-the solution (the sidecar wins field by field). Unknown fields are ignored. Implemented in phase 3:
+the solution (the sidecar wins field by field; `vars` merge by name). Unknown fields are ignored.
 
 ```json
 "stress": {
   "brute": "tools/slow.rs", "gen": "tools/make.rs", "checker": "my_checker.rs", "interactor": "talk.rs",
-  "iters": 500, "maxSize": 12, "shrinkSeeds": 100
+  "iters": 500, "maxSize": 12, "shrinkSeeds": 100,
+  "format": ["t", "repeat t {", "  n", "  a[n]", "}"],
+  "vars": { "t": "1..3", "n": "1..8", "a": "-5..5, sorted" },
+  "multitest": true
 }
 ```
 
 - File hints are paths, relative to the solution's directory, and win over the `_suffix` convention.
   A hint naming a file that does not exist is an error, not a fallback.
 - `checker` and `interactor` also apply to ordinary judging; the rest are only read with `--stress`.
-- Planned for the inferred generator (phase 4): `vars`, `multitest` and friends, e.g.
-  `{ "multitest": true, "vars": { "t": "1..5", "n": "1..8", "a": "1..n" } }`.
+- `format` (a list of lines, or one string with newlines) replaces inference; the samples are then checked
+  against it and an error says where one does not fit. `vars` replaces single constraints. `multitest` decides
+  between the readings when the samples cannot.
 
 Whether the CPH editor keeps unknown keys when it rewrites the `.prob` is not verified; the sidecar
 exists so the hints survive if it does not.
@@ -257,5 +322,5 @@ exists so the hints survive if it does not.
 | 1 | `_checker` in normal mode (introduces the extra-binary build, temp files, exit-code mapping) | **done** |
 | 2 | Interactive mode, reusing phase 1 machinery | **done** |
 | 3 | Stress with `_gen` / `_brute`, ramping, size-based shrinking, `--save`, hints and sidecar | **done** |
-| 4 | Schema inference and built-in generator, `--show-schema` | planned |
+| 4 | Schema inference and built-in generator, `--show-schema`, `--ask-constraints` | **done** |
 | 5 | Schema-aware shrinking | planned |

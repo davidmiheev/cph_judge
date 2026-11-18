@@ -12,7 +12,7 @@ A fast, concurrent competitive programming judge written in Rust, designed to wo
   - **Time Limits (TLE)**: Judged on CPU time and enforced live (Linux), with a wall-clock cap and process-tree cleanup for hung processes.
   - **Memory Limits (MLE)**: Peak resident set size tracking using `wait4` / `rusage`.
   - **Runtime Errors (RE)**: Robust exit code and signal failure detection.
-- **Stress Testing**: `--stress` hunts for a counterexample with your own generator and brute force (or interactor), shrinks it, and can save it as a test.
+- **Stress Testing**: `--stress` hunts for a counterexample with a brute force (or interactor) and a generator, shrinks it, and can save it as a test. With no generator file, tests are made from the input format inferred from the samples, and `--ask-constraints` lets you type the constraints.
 - **Interactive Problems**: Put a `<solution>_interactor.rs` next to your solution; the judge connects the two with pipes and takes the verdict from the interactor.
 - **Custom Checkers**: Drop a `<solution>_checker.rs` next to your solution to judge problems with several valid answers (testlib-style protocol).
 - **Tokenized & Float-Aware Comparison**: Token-by-token comparison with automatic floating-point epsilon tolerance ($\epsilon = 10^{-6}$) and whitespace insensitivity.
@@ -39,7 +39,7 @@ cargo test
 ## Usage
 
 ```bash
-cargo run --release -- <search_dir> <problem_name> [--stress [--iters N] [--seed S] [--max-size N] [--save]]
+cargo run --release -- <search_dir> <problem_name> [--stress [--iters N] [--seed S] [--max-size N] [--save] [--ask-constraints] [--show-schema]]
 ```
 
 ### Example
@@ -109,15 +109,16 @@ The interactor's input file for test N is kept in `<project>/target/judge/N.in`.
 
 ### Stress testing
 
-To look for an input on which your solution is wrong, add a brute-force solution and a generator next to it:
-`A.rs` is stressed with `A_brute.rs` (slow but obviously right) and `A_gen.rs`. Then:
+To look for an input on which your solution is wrong, add a brute-force solution next to it: `A.rs` is
+stressed with `A_brute.rs` (slow but obviously right). Tests come from `A_gen.rs` if you write one, and are
+otherwise [inferred from the samples](#generating-tests-from-the-samples). Then:
 
 ```bash
 cargo run --release -- <search_dir> <problem_name> --stress
 ```
 
-Each test is made by running `A_gen <seed> <size>`, which must print one test to stdout and make it larger as
-`size` grows. The judge runs the brute force and the solution on it and compares the outputs (or hands them to
+If you write a generator, each test is made by running `A_gen <seed> <size>`, which must print one test to
+stdout and make it larger as `size` grows. The judge runs the brute force and the solution on it and compares the outputs (or hands them to
 your `_checker`, if you have one, which is the right choice when several answers are valid). Sizes grow from 1
 up to `--max-size`, so small inputs, which make the clearest counterexamples, are tried first.
 
@@ -131,6 +132,8 @@ regenerates the input. For an interactive problem the interactor is the oracle a
 | `--seed S` | seed of the first test; the same seed repeats the run exactly (a fresh seed is printed otherwise) |
 | `--max-size N` | largest size given to the generator (default 20) |
 | `--save` | append the counterexample to the `.prob` as a new test, so the normal judge runs it from then on |
+| `--ask-constraints` | type the constraints of the generated input at a prompt (inferred generator only) |
+| `--show-schema` | print the inferred input format and constraints as hints, and stop (inferred generator only) |
 
 The exit code is `0` if no counterexample was found, `1` if one was, and `2` if something in the setup is wrong. A
 generator that crashes or prints nothing, a brute force that fails on a generated input (the input may be invalid,
@@ -140,6 +143,54 @@ problems with the setup, never as counterexamples. The counterexample is also ke
 
 `--save` rewrites the `.prob` as compact JSON with its keys in alphabetical order; nothing else about it changes.
 
+#### Generating tests from the samples
+
+With no `A_gen.rs`, the judge reads the samples in the `.prob` and works out the shape of the input: lines of
+numbers, arrays, strings, and repeated blocks (a list of edges, a grid, a matrix, a number of tests followed by
+that many cases). It prints what it found, and what it assumed, on every run:
+
+```
+🧬 Input format (inferred from 2 sample(s)), used to generate the tests:
+  n
+  a[n]
+  constraints:
+    n: 1..size
+    a: 1..10
+   The constraints are guesses from the samples. Set the real ones with --ask-constraints or the `vars` hint.
+```
+
+Samples show what *occurs*, never what the problem *allows*, so the shape is reliable but the constraints are
+guesses: they stay inside what the samples show, values that never exceed some number (`n`) are bounded by it,
+and a number that sets a length or count grows with the size of the test (`1..size`), so small tests come
+first. If the samples fit more than one shape, the choice made is reported, and more samples settle it. Things
+it cannot understand (non-integer numbers, blank lines inside the input, lines mixing numbers and words) are
+refused with the line number, and so are samples that do not follow one format.
+
+**Setting the constraints.** `--ask-constraints` asks about each variable in turn, showing the current constraint;
+Enter keeps it, `?` explains the syntax, and a wrong answer is explained and asked again:
+
+```
+Constraints of the generated input (Enter keeps the value in brackets, `?` shows the syntax):
+  n (number) [1..size]: 1..8
+  a (array) [1..10]: -5..5, sorted
+Save the format and constraints in .../A.stress.json so later runs use them? [y/N] y
+```
+
+| Constraint | Meaning |
+|---|---|
+| `lo..hi` | an integer from `lo` to `hi`; the bounds may use earlier numbers and `size`: `1..n`, `0..n-1`, `1..10^9`, `1e5` |
+| `lo..hi, distinct` | an array whose elements are all different (`sorted` too: non-decreasing) |
+| `perm` | an array that is a permutation of `1..length` |
+| `chars a-z` | a string over these characters (`chars 01`, `chars .#`) |
+
+Saving writes the format and the constraints to `A.stress.json`, so the next run needs no typing. The same thing
+can be written by hand in the `vars` (constraints by name), `format` (the input's shape, one line per entry) and
+`multitest` (whether the first number counts the tests) hints; `--show-schema` prints them ready to paste.
+
+What the constraint language cannot say: that edges form a tree or a simple graph, `l <= r`, "an answer exists",
+a limit on the sum of the lengths. For those, write `A_gen.rs`. Constraints that allow no input (eight different
+numbers from `1..3`) are reported as a problem with the setup, not as a counterexample.
+
 #### Hints
 
 File names and defaults can be set in a `"stress"` object in the `.prob` file, or in a `A.stress.json` next to the
@@ -148,7 +199,8 @@ file that is named but missing is an error.
 
 ```json
 "stress": { "brute": "tools/slow.rs", "gen": "tools/make.rs", "checker": "my_checker.rs",
-            "interactor": "talk.rs", "iters": 500, "maxSize": 12, "shrinkSeeds": 100 }
+            "interactor": "talk.rs", "iters": 500, "maxSize": 12, "shrinkSeeds": 100,
+            "format": ["n", "a[n]"], "vars": { "n": "1..8", "a": "-5..5" }, "multitest": false }
 ```
 
 `checker` and `interactor` apply to ordinary judging too. Command-line options win over hints. Whether the CPH

@@ -52,8 +52,8 @@ flowchart TD
   `GeneratedBins` to `src/bin/__judge_checker.rs` or `src/bin/__judge_interactor.rs` for the duration
   of the build and removed afterwards. With `autobins = false` this cannot work, so the judge exits
   with code 2 and an explanation.
-- With `--stress` the generator and, for an ordinary problem, the brute force are built too
-  (`__judge_gen`, `__judge_brute`).
+- With `--stress` the generator file (if there is one) and, for an ordinary problem, the brute force are
+  built too (`__judge_gen`, `__judge_brute`).
 - Executes `cargo build --release --bin <package> [--bin __judge_checker | --bin __judge_interactor] [--bin __judge_brute --bin __judge_gen]` (`build_release`),
   redirecting stderr to `compiler_log.txt`. Building via cargo keeps the project's edition, profile and
   dependencies for every binary.
@@ -131,7 +131,8 @@ With `"interactive": true` each test runs the solution against `<solution>_inter
 `--stress` replaces running the `.prob` tests with a search for a counterexample. After the build
 (which now also builds `<solution>_gen.rs` and, for an ordinary problem, `<solution>_brute.rs`):
 
-1. Each iteration runs `gen <seed> <size>`, then the oracle: the brute force plus the built-in comparison
+1. Each iteration makes a test (the generator file run as `gen <seed> <size>`, or the inferred generator),
+   then asks the oracle: the brute force plus the built-in comparison
    or the checker, or, for an interactive problem, the interactor. Sizes ramp from 1 to `maxSize`.
 2. `first_failure` runs iterations in parallel chunks and returns the lowest failing index.
 3. `find_smaller` shrinks a fault by trying smaller sizes with many seeds for a failure of the same kind.
@@ -142,14 +143,33 @@ judge's own setup (generator, brute force, checker, interactor); only faults are
 `first_failure` and `find_smaller` are generic over the trial function, so their ordering and shrinking
 rules are unit-tested with fake evaluators.
 
-### 9. Command Line and Hints (`cli.rs`, `hints.rs`)
+### 9. Inferred Generator (`schema.rs`, `infer.rs`, `generate.rs`, `constraints.rs`)
 
-`judge <search_dir> <problem_name> [--stress [--iters N] [--seed S] [--max-size N] [--save]]`.
+Without a generator file a stress test makes its tests inside the judge:
+
+- `schema.rs` defines the format language (a line of numbers, an array, a string, a repeated block), the
+  expressions for lengths and bounds, and the constraint syntax (`lo..hi`, `distinct`, `sorted`, `perm`,
+  `chars`). Everything prints as text and parses back, which is how `--show-schema`, the `format` and `vars`
+  hints and the prompt answers fit together.
+- `infer.rs` reads the samples (`tokenize`), finds the format by a search with backtracking over all samples
+  at once (`infer_structure`, including a multitest), reads samples back under a known format (`observe`),
+  and chooses default constraints from what they contain (`default_domains`). `build` combines this with the
+  hints, validates the result, and warns about samples that break the final constraints.
+- `generate.rs` makes a test from a format, constraints, a seed and a size (a splitmix64 generator), limiting
+  size variables to the size of the test and refusing impossible constraints or runaway inputs.
+- `constraints.rs` is the `--ask-constraints` dialogue (input and output are passed in, so it is tested with
+  scripted answers) and saving the answers into `<solution>.stress.json`.
+
+`stress.rs` takes a `Generator`: an external program, or the inferred format and constraints.
+
+### 10. Command Line and Hints (`cli.rs`, `hints.rs`)
+
+`judge <search_dir> <problem_name> [--stress [--iters N] [--seed S] [--max-size N] [--save] [--ask-constraints] [--show-schema]]`.
 Hints come from an optional `"stress"` object in the `.prob` and from a sidecar `<solution>.stress.json`
 (which wins). They name the auxiliary files (resolved against the solution's directory, overriding the
 `_suffix` convention) and tune the stress run; command-line options win over hints.
 
-### 10. Exit Codes
+### 11. Exit Codes
 
 | Code | Meaning |
 |---|---|
@@ -157,7 +177,7 @@ Hints come from an optional `"stress"` object in the `.prob` and from a sidecar 
 | 1 | Compilation failed, at least one test did not pass, or (stress) a counterexample was found |
 | 2 | Usage error, or the judge itself could not run (e.g. `.prob` not found; stress: a problem with the generator, brute force, checker or interactor) |
 
-### 11. Source Layout
+### 12. Source Layout
 
 | File | Contents |
 |---|---|
@@ -166,16 +186,21 @@ Hints come from an optional `"stress"` object in the `.prob` and from a sidecar 
 | `src/checker.rs` | `run_checker`, `interpret`, `exit_verdict` (testlib exit code → `Verdict`, shared with interactors) |
 | `src/interactive.rs` | `run_interaction`, `decide`, `interact` |
 | `src/stress.rs` | `evaluate`, `first_failure`, `find_smaller`, `run`, `save_counterexample` |
+| `src/schema.rs` | `Schema` and `Spec` (format and constraints: parse, print, validate), `Expr`, `Env` |
+| `src/infer.rs` | `infer_structure`, `observe`, `default_domains`, `build` |
+| `src/generate.rs` | `generate`, `Rng` |
+| `src/constraints.rs` | `ask`, `confirm`, `save` |
 | `src/cli.rs` | `parse`, `USAGE` |
 | `src/hints.rs` | `Hints`, `load` (the `.prob` object and the sidecar file) |
 | `src/report.rs` | Printing shared by normal and stress mode |
 | `src/runner.rs` | `run_once`, `RunReport::check`, `violation`, `Limits`, `RunError`, `format_exit_status` |
 | `src/compare.rs` | `compare_outputs` |
 
-Tests: unit tests live next to the code. `tests/checker.rs`, `tests/interactive.rs`, `tests/stress.rs` and
-`tests/paths.rs` build throwaway Cargo projects (helpers in `tests/common/`) and run the real binary.
+Tests: unit tests live next to the code. `tests/checker.rs`, `tests/interactive.rs`, `tests/stress.rs`,
+`tests/inferred.rs` and `tests/paths.rs` build throwaway Cargo projects (helpers in `tests/common/`) and run
+the real binary.
 
-Planned generator inference: see [`design-stress-interactive.md`](design-stress-interactive.md).
+Design and rationale: see [`design-stress-interactive.md`](design-stress-interactive.md).
 
 ---
 

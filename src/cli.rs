@@ -1,7 +1,8 @@
 //! Command-line parsing.
 //!
 //! ```text
-//! judge <search_dir> <problem_name> [--stress [--iters N] [--seed S] [--max-size N] [--save]]
+//! judge <search_dir> <problem_name> [--stress [--iters N] [--seed S] [--max-size N] [--save]
+//!                                    [--ask-constraints] [--show-schema]]
 //! ```
 
 pub const USAGE: &str = "\
@@ -16,6 +17,12 @@ Stress options (only with --stress):
   --max-size N   largest size passed to the generator (default 20, or `maxSize`)
   --save         append the counterexample to the .prob file as a new test
 
+Without a generator file (<solution>_gen.rs), tests are generated from the input format
+inferred from the samples in the .prob file. For that generator:
+  --ask-constraints  type the constraints of the input (n <= 8, a[i] <= n, ...) at a prompt,
+                     and optionally save them next to the solution for later runs
+  --show-schema      print the inferred format and constraints, as hints, and stop
+
 Other options:
   -h, --help     show this message";
 
@@ -28,6 +35,8 @@ pub struct Cli {
     pub seed: Option<u64>,
     pub max_size: Option<u32>,
     pub save: bool,
+    pub ask_constraints: bool,
+    pub show_schema: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -48,6 +57,8 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
         seed: None,
         max_size: None,
         save: false,
+        ask_constraints: false,
+        show_schema: false,
     };
 
     let mut args = args.iter();
@@ -66,6 +77,8 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--stress" => cli.stress = true,
             "--save" => cli.save = true,
+            "--ask-constraints" => cli.ask_constraints = true,
+            "--show-schema" => cli.show_schema = true,
             "--iters" => cli.iters = Some(positive(&value("--iters")?, "--iters")?),
             "--max-size" => cli.max_size = Some(positive(&value("--max-size")?, "--max-size")?),
             "--seed" => {
@@ -88,6 +101,8 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             (cli.seed.is_some(), "--seed"),
             (cli.max_size.is_some(), "--max-size"),
             (cli.save, "--save"),
+            (cli.ask_constraints, "--ask-constraints"),
+            (cli.show_schema, "--show-schema"),
         ] {
             if given {
                 return Err(format!("{name} only makes sense together with --stress"));
@@ -136,6 +151,18 @@ mod tests {
     }
 
     #[test]
+    fn the_constraint_flags_are_parsed_and_need_stress() {
+        let cli = run(&["d", "p", "--stress", "--ask-constraints", "--show-schema"]);
+        assert!(cli.ask_constraints && cli.show_schema);
+        let cli = run(&["d", "p", "--stress"]);
+        assert!(!cli.ask_constraints && !cli.show_schema);
+        for flag in ["--ask-constraints", "--show-schema"] {
+            let error = parse_strs(&["d", "p", flag]).unwrap_err();
+            assert!(error.contains(flag) && error.contains("--stress"), "{error}");
+        }
+    }
+
+    #[test]
     fn help_is_recognised_anywhere() {
         assert_eq!(parse_strs(&["--help"]), Ok(Parsed::Help));
         assert_eq!(parse_strs(&["dir", "prob", "-h"]), Ok(Parsed::Help));
@@ -171,7 +198,7 @@ mod tests {
 
     #[test]
     fn stress_only_options_require_stress() {
-        for flag in [&["--iters", "5"][..], &["--seed", "5"], &["--max-size", "5"], &["--save"]] {
+        for flag in [&["--iters", "5"][..], &["--seed", "5"], &["--max-size", "5"], &["--save"], &["--ask-constraints"], &["--show-schema"]] {
             let mut args = vec!["d", "p"];
             args.extend_from_slice(flag);
             let error = parse_strs(&args).unwrap_err();

@@ -5,8 +5,9 @@
 
 use std::{
     fs,
+    io::Write,
     path::PathBuf,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 pub const CARGO_TOML: &str = "[package]\nname = \"proj\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
@@ -92,6 +93,38 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
     }
 }
 "#;
+
+/// Sums the first `take` numbers (all of them for `usize::MAX`), crashing if `crash_from` is reached.
+/// Input: `n` and then `n` numbers.
+pub fn sum_program(take: &str, crash_from: Option<usize>) -> String {
+    let crash = crash_from
+        .map(|n| format!("if n >= {n} {{ panic!(\"solution exploded\"); }}"))
+        .unwrap_or_default();
+    format!(
+        r#"
+use std::io::Read;
+fn main() {{
+    let mut s = String::new();
+    std::io::stdin().read_to_string(&mut s).unwrap();
+    let mut it = s.split_whitespace().map(|t| t.parse::<i64>().unwrap());
+    let n = it.next().unwrap() as usize;
+    {crash}
+    let a: Vec<i64> = it.take(n).collect();
+    let sum: i64 = a.iter().take({take}).sum();
+    println!("{{sum}}");
+}}
+"#
+    )
+}
+
+pub fn sum_correct() -> String {
+    sum_program("usize::MAX", None)
+}
+
+/// Wrong whenever there are three or more numbers.
+pub fn sum_buggy() -> String {
+    sum_program("2", None)
+}
 
 pub fn solution_printing(line: &str) -> String {
     format!("fn main() {{ println!(\"{line}\"); }}\n")
@@ -202,13 +235,36 @@ impl Project {
         self.judge(Command::new(env!("CARGO_BIN_EXE_cph_judge")).current_dir(parent).arg(name).arg("p"))
     }
 
+    /// Runs the judge with `typed` on its standard input, as an answer to its prompts.
+    pub fn run_typing(&self, extra: &[&str], typed: &str) -> Judged {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cph_judge"));
+        command.arg(&self.root).arg("p").args(extra);
+        self.judge_with_stdin(&mut command, Some(typed))
+    }
+
     fn judge(&self, command: &mut Command) -> Judged {
-        let Output { status, stdout, stderr } = command
+        self.judge_with_stdin(command, None)
+    }
+
+    fn judge_with_stdin(&self, command: &mut Command, typed: Option<&str>) -> Judged {
+        command
             .env("NO_COLOR", "1")
             // A shared target dir would move the binaries the judge looks for.
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .expect("failed to run cph_judge");
+            .env_remove("CARGO_TARGET_DIR");
+        let Output { status, stdout, stderr } = match typed {
+            None => command.output().expect("failed to run cph_judge"),
+            Some(typed) => {
+                let mut child = command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("failed to run cph_judge");
+                // Dropping the handle closes the input, so the judge sees the end of what was typed.
+                child.stdin.take().expect("piped").write_all(typed.as_bytes()).expect("write the typed answers");
+                child.wait_with_output().expect("wait for cph_judge")
+            }
+        };
         Judged {
             code: status.code(),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),

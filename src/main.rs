@@ -2,17 +2,21 @@ mod checker;
 mod cli;
 mod compare;
 mod compile;
+mod constraints;
+mod generate;
 mod hints;
+mod infer;
 mod interactive;
 mod report;
 mod runner;
+mod schema;
 mod stress;
 
 use colored::*;
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use std::{
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -24,6 +28,7 @@ use checker::run_checker;
 use compare::compare_outputs;
 use compile::BuildOutcome;
 use hints::Hints;
+use infer::Inferred;
 use interactive::{Outcome, Program};
 use runner::{Limits, RunError, RunOutput, run_once};
 
@@ -326,12 +331,8 @@ fn choose_files(src_path: &Path, interactive: bool, hints: &Hints, stress: bool)
         return Ok(Files { verifier, brute: None, generator: None });
     }
 
-    let generator = compile::aux_file(src_path, "gen", hints.generator.as_deref())?.ok_or_else(|| {
-        format!(
-            "stress testing needs a generator; expected {} (or name one with the `gen` hint)",
-            compile::aux_path(src_path, "gen").display()
-        )
-    })?;
+    // Without a generator file the tests are made from the input format inferred from the samples.
+    let generator = compile::aux_file(src_path, "gen", hints.generator.as_deref())?;
     // An interactive problem has no brute force: the interactor knows the right answers.
     let brute = if interactive {
         None
@@ -343,7 +344,77 @@ fn choose_files(src_path: &Path, interactive: bool, hints: &Hints, stress: bool)
             )
         })?)
     };
-    Ok(Files { verifier, brute, generator: Some(generator) })
+    Ok(Files { verifier, brute, generator })
+}
+
+/// Infers the input format from the samples (and hints), shows it, and with `--ask-constraints`
+/// lets the user set the constraints at a prompt.
+fn prepare_inferred(cli: &cli::Cli, samples: &[String], hints: &Hints, src_path: &Path) -> Result<Inferred, Box<dyn std::error::Error>> {
+    let mut inferred = infer::build(samples, hints).map_err(|e| {
+        format!(
+            "could not make tests from the samples: {e}\n  Write a generator instead (expected {}) or describe the input with the `format` and `vars` hints.",
+            compile::aux_path(src_path, "gen").display()
+        )
+    })?;
+    print_inferred(&inferred, hints);
+
+    if cli.ask_constraints {
+        let stdin = io::stdin();
+        let (mut input, mut out) = (stdin.lock(), io::stdout());
+        println!();
+        let outcome = constraints::ask(&inferred.schema, &mut inferred.domains, &mut input, &mut out)?;
+        if outcome.changed {
+            inferred.warnings = infer::warnings_for(&inferred.schema, samples, &inferred.domains);
+            println!("\n🧬 Constraints now:");
+            for line in infer::summary(&inferred.schema, &inferred.domains) {
+                println!("{line}");
+            }
+            for warning in &inferred.warnings {
+                println!("⚠️  {warning}");
+            }
+            if !outcome.ended {
+                let sidecar = hints::sidecar_path(src_path);
+                let question = format!("Save the format and constraints in {} so later runs use them?", sidecar.display());
+                if constraints::confirm(&question, &mut input, &mut out)? {
+                    let format = (!inferred.format_from_hints).then(|| inferred.schema.lines());
+                    constraints::save(&sidecar, format.as_deref(), &inferred.domains)?;
+                    println!("💾 Saved to {}", sidecar.display());
+                }
+            }
+        }
+        println!();
+    }
+    Ok(inferred)
+}
+
+fn print_inferred(inferred: &Inferred, hints: &Hints) {
+    let source = if inferred.format_from_hints {
+        "from the `format` hint".to_string()
+    } else {
+        format!("inferred from {} sample(s)", inferred.sample_count)
+    };
+    println!("🧬 Input format ({source}), used to generate the tests:");
+    for line in infer::summary(&inferred.schema, &inferred.domains) {
+        println!("{line}");
+    }
+    for note in &inferred.notes {
+        println!("ℹ️  {note}");
+    }
+    for warning in &inferred.warnings {
+        println!("⚠️  {warning}");
+    }
+    if inferred.domains.keys().any(|name| !hints.vars.contains_key(name)) {
+        println!("   The constraints are guesses from the samples. Set the real ones with --ask-constraints or the `vars` hint.");
+    }
+}
+
+/// The inferred format and constraints as a hints object, ready to paste into `<solution>.stress.json`.
+fn print_schema_hints(inferred: &Inferred) {
+    let vars: serde_json::Map<String, serde_json::Value> =
+        inferred.domains.iter().map(|(name, spec)| (name.clone(), serde_json::Value::String(spec.to_string()))).collect();
+    let hints = serde_json::json!({ "format": inferred.schema.lines(), "vars": vars });
+    println!("\nHints (paste into <solution>.stress.json, or into the \"stress\" object of the .prob):");
+    println!("{}", serde_json::to_string_pretty(&hints).expect("hints are plain data"));
 }
 
 /// A seed for runs that were not given one: different every time, and printed so it can be repeated.
@@ -381,6 +452,31 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let package = compile::package_info(project_root)?;
     let src_path = Path::new(&config.src_path);
     let hints = hints::load(config.stress.clone(), src_path)?;
+
+    // A stress test without a generator file generates its tests from the samples.
+    let mut inferred = None;
+    if cli.stress {
+        match compile::aux_file(src_path, "gen", hints.generator.as_deref())? {
+            Some(generator) if cli.ask_constraints || cli.show_schema => {
+                return Err(format!(
+                    "--ask-constraints and --show-schema are about the inferred generator, but {} is used instead",
+                    generator.display()
+                )
+                .into());
+            }
+            Some(_) => {}
+            None => {
+                let samples: Vec<String> = config.tests.iter().map(|t| t.input.clone()).collect();
+                let prepared = prepare_inferred(&cli, &samples, &hints, src_path)?;
+                if cli.show_schema {
+                    print_schema_hints(&prepared);
+                    return Ok(ExitCode::SUCCESS);
+                }
+                inferred = Some(prepared);
+            }
+        }
+    }
+
     let files = choose_files(src_path, config.interactive, &hints, cli.stress)?;
     let aux = files.aux();
     if let Some(first) = aux.first()
@@ -440,7 +536,10 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         let setup = stress::Setup {
             project_root: project_root.to_path_buf(),
             solution: release_dir.join(&package.name),
-            generator: release_dir.join(compile::GENERATOR_BIN),
+            generator: match inferred {
+                Some(inferred) => stress::Generator::Inferred { schema: inferred.schema, domains: inferred.domains },
+                None => stress::Generator::External(release_dir.join(compile::GENERATOR_BIN)),
+            },
             oracle,
             limits,
             plan: stress::Plan {

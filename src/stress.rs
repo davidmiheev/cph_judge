@@ -32,9 +32,11 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use crate::{
     checker::{self, run_checker},
     compare::compare_outputs,
+    generate,
     interactive::{self, Program},
     report,
     runner::{Limits, RunError, run_once, violation},
+    schema::{Domains, Schema},
 };
 
 pub const DEFAULT_ITERS: u32 = 1000;
@@ -147,6 +149,15 @@ pub struct Evaluation {
 
 // ---- running one iteration ----------------------------------------------------------
 
+/// Where the tests come from.
+pub enum Generator {
+    /// The user's program, run as `gen <seed> <size>`; it prints one test.
+    External(PathBuf),
+    /// Made by the judge from the input format inferred from the samples (or given as a hint),
+    /// with these constraints.
+    Inferred { schema: Schema, domains: Domains },
+}
+
 pub enum Oracle {
     Brute { brute: PathBuf, checker: Option<PathBuf> },
     Interactor { interactor: PathBuf },
@@ -157,7 +168,7 @@ pub struct Env {
     /// Scratch files for the checker and interactor; one set per evaluation.
     workdir: PathBuf,
     solution: PathBuf,
-    generator: PathBuf,
+    generator: Generator,
     oracle: Oracle,
     limits: Limits,
     permits: Semaphore,
@@ -182,7 +193,7 @@ pub async fn evaluate(env: &Env, seed: u64, size: u32) -> Evaluation {
     // Evaluations are spawned freely; at most one per core actually runs.
     let _permit = env.permits.acquire().await.expect("semaphore is never closed");
 
-    let input = match generate(env, seed, size).await {
+    let input = match make_test(env, seed, size).await {
         Ok(input) => input,
         Err(problem) => {
             return Evaluation { seed, size, input: Vec::new(), failure: Some(Failure::Problem(problem)) };
@@ -195,9 +206,15 @@ pub async fn evaluate(env: &Env, seed: u64, size: u32) -> Evaluation {
     Evaluation { seed, size, input, failure }
 }
 
-async fn generate(env: &Env, seed: u64, size: u32) -> Result<Vec<u8>, Problem> {
+async fn make_test(env: &Env, seed: u64, size: u32) -> Result<Vec<u8>, Problem> {
+    let program = match &env.generator {
+        Generator::External(program) => program,
+        Generator::Inferred { schema, domains } => {
+            return generate::generate(schema, domains, seed, size).map(String::into_bytes).map_err(Problem::GeneratorFailed);
+        }
+    };
     let args = [seed.to_string(), size.to_string()];
-    let report = run_once(&env.generator, args, &env.project_root, b"", &GENERATOR_LIMITS)
+    let report = run_once(program, args, &env.project_root, b"", &GENERATOR_LIMITS)
         .await
         .map_err(|e| Problem::GeneratorFailed(explain(&e)))?;
     if let Some(error) = violation(report.status, &report.stderr, report.cpu_time, report.max_rss, &GENERATOR_LIMITS) {
@@ -375,7 +392,7 @@ where
 pub struct Setup {
     pub project_root: PathBuf,
     pub solution: PathBuf,
-    pub generator: PathBuf,
+    pub generator: Generator,
     pub oracle: Oracle,
     pub limits: Limits,
     pub plan: Plan,
@@ -403,7 +420,7 @@ pub async fn run(setup: Setup) -> io::Result<ExitCode> {
         project_root,
         workdir: workdir.clone(),
         solution,
-        generator: generator.clone(),
+        generator,
         oracle,
         limits,
         permits: Semaphore::new(parallelism),
@@ -445,7 +462,7 @@ pub async fn run(setup: Setup) -> io::Result<ExitCode> {
 
     let class = first.failure.as_ref().map(Failure::class).expect("a found evaluation has a failure");
     if let Some(Failure::Problem(problem)) = &first.failure {
-        print_problem(problem, &first, &generator);
+        print_problem(problem, &first, &env.generator);
         return Ok(ExitCode::from(2));
     }
 
@@ -482,11 +499,18 @@ pub async fn run(setup: Setup) -> io::Result<ExitCode> {
     Ok(ExitCode::from(1))
 }
 
-fn print_problem(problem: &Problem, evaluation: &Evaluation, generator: &Path) {
+fn print_problem(problem: &Problem, evaluation: &Evaluation, generator: &Generator) {
     let (title, advice) = match problem {
         Problem::GeneratorFailed(m) => (
             format!("The generator failed (seed {}, size {}): {m}", evaluation.seed, evaluation.size),
-            format!("It is run as `{} <seed> <size>` and must print one test to stdout.", generator.display()),
+            match generator {
+                Generator::External(program) => {
+                    format!("It is run as `{} <seed> <size>` and must print one test to stdout.", program.display())
+                }
+                Generator::Inferred { .. } => {
+                    "The constraints do not allow a valid input here: change them with `--ask-constraints` or the `vars` hint.".to_string()
+                }
+            },
         ),
         Problem::BruteFailed(m) => (
             format!("The brute force failed on a generated input: {m}"),
@@ -541,7 +565,14 @@ fn print_counterexample(env: &Env, iteration: u32, shrunk_from: Option<u32>, fou
         }
     }
 
-    println!("Reproduce the input with: {} {} {}", env.generator.display(), found.seed, found.size);
+    match &env.generator {
+        Generator::External(program) => {
+            println!("Reproduce the input with: {} {} {}", program.display(), found.seed, found.size);
+        }
+        Generator::Inferred { .. } => {
+            println!("The input was made by the inferred generator (seed {}, size {}).", found.seed, found.size);
+        }
+    }
     println!(
         "Files: {}/counterexample.in (and .out / .ans where they exist)",
         env.workdir.display()

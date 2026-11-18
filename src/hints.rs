@@ -10,12 +10,35 @@
 //! ```
 //!
 //! Relative file names are resolved against the solution's directory.
+//!
+//! Without a generator file, the generator is inferred from the samples. `format` (the input's
+//! shape, as lines of text or one string with newlines), `vars` (a constraint per variable) and
+//! `multitest` steer that; see [`crate::schema`] for the syntax.
+//!
+//! ```json
+//! "stress": { "format": ["n", "a[n]"], "vars": { "n": "1..8", "a": "-5..5, sorted" } }
+//! ```
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
+
+/// `format` may be written as one string with newlines or as a list of lines.
+fn format_lines<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lines {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(Option::<Lines>::deserialize(deserializer)?.map(|lines| match lines {
+        Lines::One(text) => text.lines().map(str::to_string).collect(),
+        Lines::Many(lines) => lines,
+    }))
+}
 
 #[derive(Deserialize, Debug, Default, Clone, PartialEq, Eq)]
 #[serde(default)]
@@ -30,6 +53,13 @@ pub struct Hints {
     pub max_size: Option<u32>,
     #[serde(rename = "shrinkSeeds")]
     pub shrink_seeds: Option<u32>,
+    /// The shape of the input, replacing what would be inferred from the samples.
+    #[serde(deserialize_with = "format_lines")]
+    pub format: Option<Vec<String>>,
+    /// Constraints by variable name, replacing the ones inferred.
+    pub vars: BTreeMap<String, String>,
+    /// Whether the first number of the input is the number of tests, where the samples cannot tell.
+    pub multitest: Option<bool>,
 }
 
 impl Hints {
@@ -43,6 +73,14 @@ impl Hints {
             iters: self.iters.or(fallback.iters),
             max_size: self.max_size.or(fallback.max_size),
             shrink_seeds: self.shrink_seeds.or(fallback.shrink_seeds),
+            format: self.format.or(fallback.format),
+            // Constraints are merged by name, so a sidecar can change one without repeating the rest.
+            vars: {
+                let mut vars = fallback.vars;
+                vars.extend(self.vars);
+                vars
+            },
+            multitest: self.multitest.or(fallback.multitest),
         }
     }
 }
@@ -90,6 +128,26 @@ mod tests {
         assert_eq!(hints.checker.as_deref(), Some("c.rs"));
         assert_eq!(hints.interactor.as_deref(), Some("i.rs"));
         assert_eq!((hints.iters, hints.max_size, hints.shrink_seeds), (Some(500), Some(12), Some(40)));
+        assert_eq!(hints.vars.get("n").map(String::as_str), Some("1..8"));
+        assert_eq!(hints.multitest, Some(true));
+    }
+
+    #[test]
+    fn the_format_may_be_a_list_of_lines_or_one_string() {
+        let list: Hints = serde_json::from_str(r#"{ "format": ["n", "a[n]"] }"#).unwrap();
+        let text: Hints = serde_json::from_str(r#"{ "format": "n\na[n]\n" }"#).unwrap();
+        assert_eq!(list.format, Some(vec!["n".to_string(), "a[n]".to_string()]));
+        assert_eq!(text.format, list.format);
+        assert_eq!(serde_json::from_str::<Hints>("{}").unwrap().format, None);
+    }
+
+    #[test]
+    fn vars_are_merged_by_name() {
+        let high = Hints { vars: BTreeMap::from([("n".into(), "1..5".into())]), ..Hints::default() };
+        let low = Hints { vars: BTreeMap::from([("n".into(), "1..9".into()), ("a".into(), "1..3".into())]), ..Hints::default() };
+        let merged = high.or(low);
+        assert_eq!(merged.vars["n"], "1..5");
+        assert_eq!(merged.vars["a"], "1..3");
     }
 
     #[test]

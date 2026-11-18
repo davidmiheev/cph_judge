@@ -27,39 +27,8 @@ fn main() {
 }
 "#;
 
-/// Sums the first `take` numbers (all of them for `usize::MAX`), crashing if `crash_from` is reached.
-fn sum_program(take: &str, crash_from: Option<usize>) -> String {
-    let crash = crash_from
-        .map(|n| format!("if n >= {n} {{ panic!(\"solution exploded\"); }}"))
-        .unwrap_or_default();
-    format!(
-        r#"
-use std::io::Read;
-fn main() {{
-    let mut s = String::new();
-    std::io::stdin().read_to_string(&mut s).unwrap();
-    let mut it = s.split_whitespace().map(|t| t.parse::<i64>().unwrap());
-    let n = it.next().unwrap() as usize;
-    {crash}
-    let a: Vec<i64> = it.take(n).collect();
-    let sum: i64 = a.iter().take({take}).sum();
-    println!("{{sum}}");
-}}
-"#
-    )
-}
-
 fn sum_generator() -> String {
     format!("{RNG}\n{SUM_GEN_MAIN}")
-}
-
-fn sum_correct() -> String {
-    sum_program("usize::MAX", None)
-}
-
-/// Wrong whenever there are three or more numbers.
-fn sum_buggy() -> String {
-    sum_program("2", None)
 }
 
 /// A project for the sum problem with the given solution; brute force and generator are in place.
@@ -306,12 +275,14 @@ fn a_generator_that_prints_nothing_is_reported() {
 }
 
 #[test]
-fn a_missing_generator_names_the_file_it_expected() {
+fn without_a_generator_and_without_samples_the_error_names_the_file_it_expected() {
+    // With samples the input format is inferred (see tests/inferred.rs); with none there is nothing to go on.
     let p = sum_project("no_gen", &sum_correct());
     fs::remove_file(p.root.join("sol/A_gen.rs")).unwrap();
+    p.problem(&[]);
     let r = p.run_with(&["--stress"]);
     assert_eq!(r.code, Some(2), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
-    assert!(r.stderr.contains("needs a generator") && r.stderr.contains("A_gen.rs"), "{}", r.stderr);
+    assert!(r.stderr.contains("no samples") && r.stderr.contains("A_gen.rs"), "{}", r.stderr);
 }
 
 #[test]
